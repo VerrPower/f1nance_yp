@@ -1,0 +1,11 @@
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/ValueOnlyTextOutputFormat.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/NonSplittableTextInputFormat.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/Snapshot.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/App.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/AverageReducer.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/FactorWritable.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/FactorCombiner.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/Driver.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/DayPartitioner.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/StockFactorMapper.java
+/home/pogi/FINANCE_for_YP/factor-mapreduce/src/main/java/factor/DayTimeKey.java
