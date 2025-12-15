@@ -7,9 +7,10 @@
 评分规则：
 对每个因子 i，在所有交易日的所有时刻 t 上计算
     e_t = |x_t - x'_t| / |x'_t|
-并取平均误差：
-    e_i^{mean} = (1/|T|) * sum_{t∈T} e_t
-若 e_i^{mean} <= 0.01（1%）则该因子判定为正确。
+并可选择汇总准则（由 --crit 控制）：
+    - mean：e_i^{mean} = (1/|T|) * sum_{t∈T} e_t
+    - max ：e_i^{max} = max_t e_t
+若汇总误差 <= 0.01（1%）则该因子判定为正确。
 
 本脚本约定：
 - 标准答案目录优先使用仓库根目录下的 `std_red/`；若不存在则回退到 `std_ref/`
@@ -226,6 +227,7 @@ def normalize_day(day: str) -> str:
 @dataclass
 class EvalResult:
     factor_mean_errors: List[float]
+    factor_max_errors: List[float]
     factor_errors: List[List[float]]
     matched_points: int
     missing_pred_points: int
@@ -234,6 +236,7 @@ class EvalResult:
 
 
 def evaluate(truth: Dict[str, DayData], pred: Dict[str, DayData], *, eps: float) -> EvalResult:
+    max_errors = [0.0] * FACTOR_COUNT
     sum_errors = [0.0] * FACTOR_COUNT
     per_factor: List[List[float]] = [[] for _ in range(FACTOR_COUNT)]
     count = 0
@@ -258,6 +261,8 @@ def evaluate(truth: Dict[str, DayData], pred: Dict[str, DayData], *, eps: float)
                     denom = eps
                     zero_denom += 1
                 e_t = abs(pred_vals[i] - truth_vals[i]) / denom
+                if e_t > max_errors[i]:
+                    max_errors[i] = e_t
                 sum_errors[i] += e_t
                 per_factor[i].append(e_t)
 
@@ -276,6 +281,7 @@ def evaluate(truth: Dict[str, DayData], pred: Dict[str, DayData], *, eps: float)
     mean_errors = [s / count for s in sum_errors]
     return EvalResult(
         factor_mean_errors=mean_errors,
+        factor_max_errors=max_errors,
         factor_errors=per_factor,
         matched_points=count,
         missing_pred_points=missing_pred,
@@ -285,6 +291,7 @@ def evaluate(truth: Dict[str, DayData], pred: Dict[str, DayData], *, eps: float)
 
 
 def evaluate_day(truth_day: DayData, pred_day: DayData, *, eps: float) -> EvalResult:
+    max_errors = [0.0] * FACTOR_COUNT
     sum_errors = [0.0] * FACTOR_COUNT
     per_factor: List[List[float]] = [[] for _ in range(FACTOR_COUNT)]
     count = 0
@@ -304,6 +311,8 @@ def evaluate_day(truth_day: DayData, pred_day: DayData, *, eps: float) -> EvalRe
                 denom = eps
                 zero_denom += 1
             e_t = abs(pred_vals[i] - truth_vals[i]) / denom
+            if e_t > max_errors[i]:
+                max_errors[i] = e_t
             sum_errors[i] += e_t
             per_factor[i].append(e_t)
 
@@ -317,6 +326,7 @@ def evaluate_day(truth_day: DayData, pred_day: DayData, *, eps: float) -> EvalRe
     mean_errors = [s / count for s in sum_errors]
     return EvalResult(
         factor_mean_errors=mean_errors,
+        factor_max_errors=max_errors,
         factor_errors=per_factor,
         matched_points=count,
         missing_pred_points=missing_pred,
@@ -324,14 +334,32 @@ def evaluate_day(truth_day: DayData, pred_day: DayData, *, eps: float) -> EvalRe
         zero_denom_points=zero_denom,
     )
 
+def _metric_values(result: EvalResult, crit: str) -> List[float]:
+    c = (crit or "mean").lower()
+    if c == "mean":
+        return result.factor_mean_errors
+    if c == "max":
+        return result.factor_max_errors
+    raise ValueError(f"未知 --crit：{crit!r}（应为 mean/max）")
+
+
+def _metric_label(crit: str) -> str:
+    c = (crit or "mean").lower()
+    if c == "mean":
+        return "mean_error"
+    if c == "max":
+        return "max_error"
+    return "error"
+
 
 def maybe_plot_histograms(
     *,
     plot_dir: str,
     threshold: float,
-    mean_errors: List[float],
+    metric_values: List[float],
     per_factor_errors: List[List[float]],
     mode: str,
+    crit: str,
 ) -> None:
     mode = (mode or "none").lower()
     if mode == "none":
@@ -379,8 +407,8 @@ def maybe_plot_histograms(
     for i in range(FACTOR_COUNT):
         factor_id = i + 1
         name = FACTOR_NAMES.get(factor_id, "")
-        mean_err = mean_errors[i]
-        ok = mean_err <= threshold
+        metric = metric_values[i]
+        ok = metric <= threshold
         if only_reject and ok:
             continue
 
@@ -388,7 +416,7 @@ def maybe_plot_histograms(
         color = "C0" if ok else "C3"
         status = "PASS" if ok else "FAIL"
         title_base = f"alpha_{factor_id:02d}-{name}"
-        legend_label = f"{title_base}-{status}  mean_error={sci_latex(mean_err)}"
+        legend_label = f"{title_base}-{status}  {_metric_label(crit)}={sci_latex(metric)}"
 
         out_path = os.path.join(plot_dir, f"{title_base}.png")
 
@@ -478,6 +506,12 @@ def maybe_plot_histograms(
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--day", default=None, help="校验单天（如 0108）；留空则校验标准答案目录下全部天")
+    parser.add_argument(
+        "--crit",
+        default="mean",
+        choices=["mean", "max"],
+        help="误差汇总准则：mean=对所有时刻取平均；max=对所有时刻取最大值（默认 mean）",
+    )
     parser.add_argument("--eps", type=float, default=1e-12, help="标准值为 0 时的分母替代值")
     # 新参数名：--plot（保留 --err-distr 作为兼容别名）
     parser.add_argument(
@@ -534,6 +568,7 @@ def main(argv: List[str]) -> int:
 
     print(f"标准答案目录：{TRUTH_DIR}")
     print(f"预测输出目录：{pred_dir}")
+    print(f"误差准则：{args.crit}")
     if missing_days:
         print(f"缺失 day 输出：{', '.join(missing_days)}")
     if day is None and extra_days:
@@ -566,16 +601,17 @@ def main(argv: List[str]) -> int:
     columns: Dict[str, List[str]] = {}
     for d in sorted(day_results.keys()):
         r = day_results[d]
+        metric_values = _metric_values(r, args.crit)
         day_has_fail = (
-            any(err > THRESHOLD for err in r.factor_mean_errors)
+            any(err > THRESHOLD for err in metric_values)
             or r.missing_pred_points > 0
             or r.missing_truth_points > 0
         )
         col_label = f"{cell_tag(not day_has_fail)} {d}"
         col_values: List[str] = []
-        for mean_err in r.factor_mean_errors:
-            ok = mean_err <= THRESHOLD
-            col_values.append(f"{cell_tag(ok)} {fmt_mean_err(mean_err)}")
+        for metric in metric_values:
+            ok = metric <= THRESHOLD
+            col_values.append(f"{cell_tag(ok)} {fmt_mean_err(metric)}")
         columns[col_label] = col_values
 
     df = pd.DataFrame(columns, index=factor_index)
@@ -619,7 +655,7 @@ def main(argv: List[str]) -> int:
         if r is None:
             all_days_ok = False
             continue
-        if any(err > THRESHOLD for err in r.factor_mean_errors):
+        if any(err > THRESHOLD for err in _metric_values(r, args.crit)):
             all_days_ok = False
         if r.missing_pred_points != 0 or r.missing_truth_points != 0:
             all_days_ok = False
@@ -646,18 +682,20 @@ def main(argv: List[str]) -> int:
             maybe_plot_histograms(
                 plot_dir=plot_root,
                 threshold=THRESHOLD,
-                mean_errors=day_result.factor_mean_errors,
+                metric_values=_metric_values(day_result, args.crit),
                 per_factor_errors=day_result.factor_errors,
                 mode=args.plot,
+                crit=args.crit,
             )
         else:
             for d, day_result in day_results.items():
                 maybe_plot_histograms(
                     plot_dir=os.path.join(plot_root, d),
                     threshold=THRESHOLD,
-                    mean_errors=day_result.factor_mean_errors,
+                    metric_values=_metric_values(day_result, args.crit),
                     per_factor_errors=day_result.factor_errors,
                     mode=args.plot,
+                    crit=args.crit,
                 )
         print(f"直方图已输出到：{plot_root}")
     all_ok = all_days_ok

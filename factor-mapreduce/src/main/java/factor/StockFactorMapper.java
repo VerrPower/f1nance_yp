@@ -69,12 +69,7 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
 
     private static boolean shouldEmit(long tradeTime) {
         // 标准答案输出时间窗口：9:30:00~11:30:00 + 13:00:00~15:00:00（含端点）。
-        // 数据里的 tradeTime 通常是 6 位 HHmmss（例如 093000），parse 成 long 后会变为 93000。
-        if (tradeTime < 0 || tradeTime >= 1_000_000L) {
-            // 若出现包含小数秒的更长时间戳（HHmmssffffffff），这里无法按整数区间比较；
-            // 为避免误删，默认输出。
-            return true;
-        }
+        // tradeTime 在输入 CSV 中通常是 6 位 HHmmss（例如 093000），parse 成 long 后会变为 93000（前导零丢失）。
         return (tradeTime >= 93_000L && tradeTime <= 113_000L)
                 || (tradeTime >= 130_000L && tradeTime <= 150_000L);
     }

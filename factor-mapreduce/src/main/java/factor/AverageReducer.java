@@ -85,9 +85,7 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
     }
 
     private static String formatTradeTime(long tradeTime) {
-        // 兼容两种常见格式：
-        // 1) 6 位 HHmmss（例如 092500）——标准答案通常保留前导零；
-        // 2) 更长的 Int64（例如包含小数秒的 HHmmssffffffff）——此时不做补齐，直接输出原数值。
+        // 标准答案的 tradeTime 使用 6 位 HHmmss（例如 092500），这里统一补齐前导零。
         if (tradeTime >= 0 && tradeTime < 1_000_000L) {
             return String.format(Locale.ROOT, "%06d", tradeTime);
         }
