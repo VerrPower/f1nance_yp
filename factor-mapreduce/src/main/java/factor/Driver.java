@@ -21,10 +21,10 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
  * <ol>
  *   <li><b>InputFormat：</b>{@link NonSplittableTextInputFormat} 禁止切分单个股票 CSV 文件，
  *   确保 Mapper 内部维护的“上一条快照（t-1）”不因 split 边界丢失（影响 alpha_17/18/19）。</li>
- *   <li><b>Mapper：</b>{@link StockFactorMapper} 逐行解析 {@link Snapshot}，计算 20 个因子，
- *   输出键为 {@link DayTimeKey}(tradingDay, tradeTime)，值为 {@link FactorWritable}(因子向量 + 计数)。</li>
+ *   <li><b>Mapper：</b>{@link StockFactorMapper} 逐行解析 CSV（直接在 {@code byte[]} 上做 ASCII 扫描），计算 20 个因子，
+ *   输出键为 {@link DayTimeKey}(tradingDay, tradeTime)，值为 {@link FactorWritable}(20 维因子向量“求和态”。)</li>
  *   <li><b>Combiner：</b>{@link FactorCombiner} 对同一个 (day,time) 的 value 做本地预聚合
- *   （求和 + 累计计数），减少 shuffle 传输量。</li>
+ *   （逐维求和），减少 shuffle 传输量。</li>
  *   <li><b>Partitioner：</b>{@link DayPartitioner} 仅按 tradingDay 分区，避免不同日期混到同一个 reduce 分区。</li>
  *   <li><b>Reducer：</b>{@link AverageReducer} 计算每个 (day,time) 的 300股截面平均，
  *   并用 {@code MultipleOutputs} 按天输出 CSV（含表头）。</li>
@@ -46,18 +46,18 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
  *   +------------------------------+
  *   | Mapper（逐行）                |
  *   | 1) 跳过表头/空行              |
- *   | 2) 解析 Snapshot（取前5档）   |
+ *   | 2) 解析 CSV（取前5档）        |
  *   | 3) 计算 20 因子               |
  *   |    - alpha_17/18/19 依赖 t-1  |
  *   | 4) 输出：                     |
  *   |    key   = (tradingDay,tradeTime)
- *   |    value = (sum[20], count=1)|
+ *   |    value = sum[20]           |
  *   +------------------------------+
  *                 |
  *                 v
  *   +------------------------------+
  *   | Combiner（可选，本地预聚合）  |
- *   | 对同 key：sum += sum，count++ |
+ *   | 对同 key：sum += sum          |
  *   +------------------------------+
  *                 |
  *                 v
@@ -130,19 +130,14 @@ public class Driver {
 
         // 关键点：禁止 split，保证 t-1 因子在 mapper 内正确计算。
         job.setInputFormatClass(NonSplittableTextInputFormat.class);
-        
-        job.setMapperClass(StockFactorMapper.class);
-        job.setReducerClass(AverageReducer.class);
-        
-        // Combiner can be used to pre-aggregate sums if we implement it carefully.
-        // Since FactorWritable.add sums up factors and counts, it is associative and commutative.
-        // So we can use the same logic for Combiner as Reducer? 
-        // No, Reducer outputs Text (CSV string), Combiner must output FactorWritable.
-        // We need a separate Combiner class or modify Reducer to be more generic?
-        // For simplicity in Stage 1, we skip Combiner or implement a specific one.
-        // Let's implement a Combiner to optimize network traffic.
-        job.setCombinerClass(FactorCombiner.class);
 
+        // 固定 double（float 精度不满足 validate 门限，且提速不明显）。
+        job.setMapperClass(StockFactorMapper.class);
+        job.setCombinerClass(FactorCombiner.class);
+        job.setReducerClass(AverageReducer.class);
+        job.setMapOutputKeyClass(DayTimeKey.class);
+        job.setMapOutputValueClass(FactorWritable.class);
+        
         // 关键点：使用数值型复合 key，按 (tradingDay, tradeTime) 聚合与排序，并按天分区输出。
         job.setPartitionerClass(DayPartitioner.class);
 
@@ -150,9 +145,6 @@ public class Driver {
         // 如需性能调优，可通过 -Dfactor.reducers=N 覆盖；若 N>1，请确保分区策略与下游合并逻辑能处理多输出文件。
         job.setNumReduceTasks(conf.getInt("factor.reducers", 1));
 
-        job.setMapOutputKeyClass(DayTimeKey.class);
-        job.setMapOutputValueClass(FactorWritable.class);
-        
         job.setOutputKeyClass(NullWritable.class);
         job.setOutputValueClass(Text.class);
         // 关键点：输出只写 value（CSV 行），不写 key<TAB>value。

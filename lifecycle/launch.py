@@ -7,7 +7,7 @@
 默认参数（可通过环境变量覆盖）：
 - JAR_PATH: factor-mapreduce/target/factor-mapreduce-0.1.0-SNAPSHOT.jar
 - MAIN_CLASS: factor.Driver
-- HDFS_INPUT: 由 --day 参数计算（0102 -> /.../0102/*/snapshot.csv；None -> /.../*/*/snapshot.csv）
+- HDFS_INPUT: 固定读取全部 day：/user/pogi/HD_INPUT_REPO/FINANCE_for_YP/*/*/snapshot.csv
 - HDFS_OUTPUT: /user/pogi/HD_OUTPUT_REPO/FINANCE_for_YP/run_<timestamp>
 - LOCAL_OUT_DIR: local_buffer/hdfs_out
 """
@@ -71,25 +71,18 @@ class JobConfig:
     local_out_dir: Path
     timing: bool
     log_mode: str
-    log_file: Optional[Path]
 
 
-def build_hdfs_input(day: str | None) -> str:
-    # 输入必须是“文件”，不能是仅包含子目录的目录；本项目读取每个股票的 snapshot.csv。
-    # - day=None：跑全部 day：/ROOT/*/*/snapshot.csv
-    # - day=0102：跑单天：/ROOT/0102/*/snapshot.csv
-    if day is None:
-        return f"{DEFAULT_HDFS_INPUT_ROOT}/*/*/snapshot.csv"
-    if not (len(day) == 4 and day.isdigit()):
-        raise ValueError(f"--day 需要 4 位数字（如 0102），实际：{day!r}")
-    return f"{DEFAULT_HDFS_INPUT_ROOT}/{day}/*/snapshot.csv"
+def build_hdfs_input() -> str:
+    # 固定跑全部 day：/ROOT/*/*/snapshot.csv
+    return f"{DEFAULT_HDFS_INPUT_ROOT}/*/*/snapshot.csv"
 
 
-def load_config(day: str | None) -> JobConfig:
+def load_config() -> JobConfig:
     root = repo_root()
     jar_path = Path(os.environ.get("JAR_PATH", str(root / DEFAULT_JAR_PATH)))
     main_class = os.environ.get("MAIN_CLASS", DEFAULT_MAIN_CLASS)
-    hdfs_input = os.environ.get("HDFS_INPUT", build_hdfs_input(day))
+    hdfs_input = os.environ.get("HDFS_INPUT", build_hdfs_input())
     hdfs_output = os.environ.get(
         "HDFS_OUTPUT",
         f"{DEFAULT_HDFS_OUTPUT_ROOT}/run_{time.strftime('%Y%m%d_%H%M%S')}",
@@ -103,7 +96,6 @@ def load_config(day: str | None) -> JobConfig:
         local_out_dir=local_out_dir,
         timing=True,
         log_mode="mute",
-        log_file=None,
     )
 
 
@@ -115,8 +107,6 @@ def print_config(cfg: JobConfig) -> None:
     print(f"Local out : {cfg.local_out_dir}")
     print(f"Timing    : {cfg.timing}")
     print(f"Log mode  : {cfg.log_mode}")
-    if cfg.log_file is not None:
-        print(f"Log file  : {cfg.log_file}")
 
 
 def _hadoop_env_for_mute() -> dict[str, str]:
@@ -130,7 +120,7 @@ def _hadoop_env_for_mute() -> dict[str, str]:
 
 def hdfs_ls(pattern: str, *, cfg: JobConfig) -> list[str]:
     env = _hadoop_env_for_mute() if cfg.log_mode == "mute" else None
-    stderr = subprocess.DEVNULL if cfg.log_mode in {"redirect", "mute"} else subprocess.STDOUT
+    stderr = subprocess.DEVNULL if cfg.log_mode == "mute" else subprocess.STDOUT
     out = capture(["hdfs", "dfs", "-ls", pattern], check=False, stderr=stderr, env=env)
     paths: list[str] = []
     for line in out.splitlines():
@@ -142,23 +132,23 @@ def hdfs_ls(pattern: str, *, cfg: JobConfig) -> list[str]:
 
 def hdfs_exists(path: str, *, cfg: JobConfig) -> bool:
     env = _hadoop_env_for_mute() if cfg.log_mode == "mute" else None
-    stdout = subprocess.DEVNULL if cfg.log_mode in {"redirect", "mute"} else None
-    stderr = subprocess.DEVNULL if cfg.log_mode in {"redirect", "mute"} else None
+    stdout = subprocess.DEVNULL if cfg.log_mode == "mute" else None
+    stderr = subprocess.DEVNULL if cfg.log_mode == "mute" else None
     return subprocess.run(["hdfs", "dfs", "-test", "-e", path], stdout=stdout, stderr=stderr, env=env).returncode == 0
 
 
 def hdfs_rm(path: str, *, cfg: JobConfig) -> None:
     env = _hadoop_env_for_mute() if cfg.log_mode == "mute" else None
-    stdout = subprocess.DEVNULL if cfg.log_mode in {"redirect", "mute"} else None
-    stderr = subprocess.DEVNULL if cfg.log_mode in {"redirect", "mute"} else None
+    stdout = subprocess.DEVNULL if cfg.log_mode == "mute" else None
+    stderr = subprocess.DEVNULL if cfg.log_mode == "mute" else None
     run(["hdfs", "dfs", "-rm", "-r", "-f", path], check=False, stdout=stdout, stderr=stderr, env=env)
 
 
 def hdfs_get(src_dir: str, local_parent_dir: Path, *, cfg: JobConfig) -> Path:
     local_parent_dir.mkdir(parents=True, exist_ok=True)
     env = _hadoop_env_for_mute() if cfg.log_mode == "mute" else None
-    stdout = subprocess.DEVNULL if cfg.log_mode in {"redirect", "mute"} else None
-    stderr = subprocess.DEVNULL if cfg.log_mode in {"redirect", "mute"} else None
+    stdout = subprocess.DEVNULL if cfg.log_mode == "mute" else None
+    stderr = subprocess.DEVNULL if cfg.log_mode == "mute" else None
     run(["hdfs", "dfs", "-get", src_dir, str(local_parent_dir)], stdout=stdout, stderr=stderr, env=env)
     return local_parent_dir / Path(src_dir).name
 
@@ -206,15 +196,6 @@ def run_job(cfg: JobConfig) -> None:
     jar_cmd = ["hadoop", "jar", str(cfg.jar_path), cfg.main_class, timing_flag, cfg.hdfs_input, cfg.hdfs_output]
     if cfg.log_mode == "normal":
         subprocess.run(jar_cmd, check=True)
-    elif cfg.log_mode == "redirect":
-        if cfg.log_file is None:
-            raise SystemExit("log_mode=redirect 需要 log_file")
-        cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(cfg.log_file, "a", encoding="utf-8") as f:
-            f.write(sep() + "\n")
-            f.write("Command: " + " ".join(jar_cmd) + "\n")
-            f.flush()
-            subprocess.run(jar_cmd, check=True, text=True, stdout=f, stderr=f)
     elif cfg.log_mode == "mute":
         env = _hadoop_env_for_mute()
         # 只禁掉 Hadoop/HDFS 的 console 日志（通常走 stderr），保留 stdout 以显示自定义输出（如 timing）。
@@ -238,13 +219,11 @@ def run_job(cfg: JobConfig) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="运行 Hadoop 作业并拷回本地（参数默认从环境变量读取）。")
-    parser.add_argument("--day", default=None, help="指定单天（如 0102）；不填则跑全部 day")
-    parser.add_argument("--dry-run", action="store_true", help="只打印配置与 preflight 结果，不实际启动作业")
     parser.add_argument(
         "--log",
-        choices=["normal", "redirect", "mute"],
+        choices=["normal", "mute"],
         default="mute",
-        help="控制输出：normal=不干预；redirect=重定向到日志文件；mute=调高日志级别并尽量禁输出",
+        help="控制输出：normal=不干预；mute=调高日志级别并尽量禁输出",
     )
     parser.add_argument(
         "--timing",
@@ -252,31 +231,11 @@ def main() -> int:
         default="True",
         help="是否让 jar 输出计时信息（默认 True，会传 --timing=True 给 jar）",
     )
-    parser.add_argument(
-        "--log-file",
-        default=None,
-        help="当 --log=redirect 时，输出重定向到该文件（默认：local_buffer/logs/launch_<timestamp>.log）",
-    )
     args = parser.parse_args()
 
-    cfg = load_config(args.day)
+    cfg = load_config()
     cfg = JobConfig(**{**cfg.__dict__, "timing": str(args.timing).lower() == "true"})
     cfg = JobConfig(**{**cfg.__dict__, "log_mode": str(args.log)})
-    if cfg.log_mode == "redirect":
-        if args.log_file:
-            log_file = Path(args.log_file)
-        else:
-            log_file = repo_root() / "local_buffer" / "logs" / f"launch_{time.strftime('%Y%m%d_%H%M%S')}.log"
-        cfg = JobConfig(**{**cfg.__dict__, "log_file": log_file})
-
-    if args.dry_run:
-        print(sep())
-        print("作业配置如下：")
-        print_config(cfg)
-        print(sep())
-        print("\n\n")
-        preflight(cfg)
-        return 0
 
     run_job(cfg)
     return 0

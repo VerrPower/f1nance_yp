@@ -1,7 +1,6 @@
 factor/AverageReducer.class
 factor/DayPartitioner.class
 factor/ValueOnlyTextOutputFormat$1.class
-factor/Snapshot.class
 factor/FactorWritable.class
 factor/NonSplittableTextInputFormat.class
 factor/DayTimeKey.class
