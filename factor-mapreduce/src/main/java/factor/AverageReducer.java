@@ -20,6 +20,7 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
     private final Text outValue = new Text();
     private MultipleOutputs<NullWritable, Text> multipleOutputs;
     private long currentDay = Long.MIN_VALUE;
+    private static final int EXPECTED_STOCKS = 300;
 
     @Override
     protected void setup(Context context) {
@@ -34,10 +35,6 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
             sum.add(val);
         }
 
-        if (sum.getCount() == 0) {
-            return;
-        }
-
         if (key.getTradingDay() != currentDay) {
             currentDay = key.getTradingDay();
             // 每个交易日的输出文件首行写表头（MultipleOutputs 按 tradingDay 分目录）。
@@ -45,8 +42,8 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
         }
 
         double[] averages = new double[20];
-        double[] totals = sum.getFactors();
-        int count = sum.getCount();
+        double[] totals = sum.factors;
+        int count = EXPECTED_STOCKS;
 
         StringJoiner joiner = new StringJoiner(",");
         // tradeTime 在原始 CSV 中通常是 6 位（例如 092500），这里补齐前导零，避免与标准输出对齐失败。

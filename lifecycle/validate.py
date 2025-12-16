@@ -21,6 +21,10 @@
 - 不指定 `--day`：自动选择包含输出文件的最新目录，尝试校验 std_red 中全部交易日；
   对缺失的 day 输出会打印出来。
 
+校验口径（由 --mode 控制）：
+- sense：默认口径（本脚本的“按点误差 + 汇总准则 --crit”），支持绘图等增强功能
+- form：复刻老师给的示例脚本口径（更轻量，仅打印 True/False；忽略 --crit/--plot 等增强参数）
+
 误差分布直方图：
 - 通过 `--plot` 控制：不画/只画不通过因子/画全部因子
 - 若指定 `--day`：输出到 `err_distr_out/plot_<day>/`（目录存在则先删除重建）
@@ -43,7 +47,6 @@ from typing import Dict, List, Optional, Tuple
 
 
 FACTOR_COUNT = 20
-HEADER = ["tradeTime"] + [f"alpha_{i}" for i in range(1, FACTOR_COUNT + 1)]
 THRESHOLD = 0.01
 
 FACTOR_NAMES: Dict[int, str] = {
@@ -235,59 +238,73 @@ class EvalResult:
     zero_denom_points: int
 
 
-def evaluate(truth: Dict[str, DayData], pred: Dict[str, DayData], *, eps: float) -> EvalResult:
-    max_errors = [0.0] * FACTOR_COUNT
-    sum_errors = [0.0] * FACTOR_COUNT
-    per_factor: List[List[float]] = [[] for _ in range(FACTOR_COUNT)]
-    count = 0
-    missing_pred = 0
-    missing_truth = 0
-    zero_denom = 0
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-    for day, truth_day in truth.items():
-        pred_day = pred.get(day)
-        if pred_day is None:
-            missing_pred += len(truth_day.rows)
-            continue
-        for t, truth_vals in truth_day.rows.items():
-            pred_vals = pred_day.rows.get(t)
-            if pred_vals is None:
-                missing_pred += 1
-                continue
-            count += 1
-            for i in range(FACTOR_COUNT):
-                denom = abs(truth_vals[i])
-                if denom == 0.0:
-                    denom = eps
-                    zero_denom += 1
-                e_t = abs(pred_vals[i] - truth_vals[i]) / denom
-                if e_t > max_errors[i]:
-                    max_errors[i] = e_t
-                sum_errors[i] += e_t
-                per_factor[i].append(e_t)
 
-    for day, pred_day in pred.items():
-        truth_day = truth.get(day)
-        if truth_day is None:
-            missing_truth += len(pred_day.rows)
-            continue
-        for t in pred_day.rows.keys():
-            if t not in truth_day.rows:
-                missing_truth += 1
+def bold(text: str) -> str:
+    return f"\033[1m{text}\033[0m"
 
-    if count == 0:
-        raise ValueError("没有任何可对齐的 (day,tradeTime) 点，请检查输出路径与文件内容。")
 
-    mean_errors = [s / count for s in sum_errors]
-    return EvalResult(
-        factor_mean_errors=mean_errors,
-        factor_max_errors=max_errors,
-        factor_errors=per_factor,
-        matched_points=count,
-        missing_pred_points=missing_pred,
-        missing_truth_points=missing_truth,
-        zero_denom_points=zero_denom,
-    )
+def visible_len(text: str) -> int:
+    return len(ANSI_RE.sub("", text))
+
+
+def ljust_visible(text: str, width: int) -> str:
+    pad = max(0, width - visible_len(text))
+    return text + (" " * pad)
+
+
+def fmt_metric(value: float) -> str:
+    return "0" if value == 0.0 else f"{value:.2e}"
+
+
+def cell_tag(ok: bool) -> str:
+    return "[P]" if ok else f"[{bold('F')}]"
+
+
+def print_factor_table(
+    *,
+    day_results: Dict[str, "EvalResult"],
+    crit: str,
+    missing_days: List[str],
+    extra_days: List[str],
+) -> None:
+    factor_labels = [f"alpha_{i:02d}" for i in range(1, FACTOR_COUNT + 1)]
+    days = sorted(day_results.keys())
+
+    columns: List[Tuple[str, List[str]]] = []
+    for day in days:
+        r = day_results[day]
+        metric_values = _metric_values(r, crit)
+        day_has_fail = (
+            any(v > THRESHOLD for v in metric_values)
+            or r.missing_pred_points > 0
+            or r.missing_truth_points > 0
+        )
+        col_label = f"{cell_tag(not day_has_fail)} {day}"
+        col_values = [f"{cell_tag(v <= THRESHOLD)} {fmt_metric(v)}" for v in metric_values]
+        columns.append((col_label, col_values))
+
+    print("\n=========================== FACTOR TABLE ===========================")
+    index_header = "fctr/day"
+    index_width = max(visible_len(index_header), max((visible_len(x) for x in factor_labels), default=0))
+    col_widths = [max(visible_len(label), max((visible_len(v) for v in values), default=0)) for label, values in columns]
+
+    header_cells = [ljust_visible(index_header, index_width)] + [
+        ljust_visible(label, w) for (label, _), w in zip(columns, col_widths)
+    ]
+    print("  ".join(header_cells).rstrip())
+
+    for row_i, factor in enumerate(factor_labels):
+        row = [ljust_visible(factor, index_width)]
+        for (_, values), w in zip(columns, col_widths):
+            row.append(ljust_visible(values[row_i], w))
+        print("  ".join(row).rstrip())
+
+    if missing_days:
+        print(f"\n缺失 day 输出：{', '.join(missing_days)}")
+    if extra_days:
+        print(f"预测多余 day（标准答案中不存在）：{', '.join(extra_days)}")
 
 
 def evaluate_day(truth_day: DayData, pred_day: DayData, *, eps: float) -> EvalResult:
@@ -507,6 +524,12 @@ def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--day", default=None, help="校验单天（如 0108）；留空则校验标准答案目录下全部天")
     parser.add_argument(
+        "--mode",
+        default="form",
+        choices=["sense", "form"],
+        help="校验模式：sense=本脚本口径（默认）；form=老师示例脚本口径（轻量，仅打印 True/False）",
+    )
+    parser.add_argument(
         "--crit",
         default="mean",
         choices=["mean", "max"],
@@ -565,23 +588,81 @@ def main(argv: List[str]) -> int:
         extra_days = sorted(set(pred.keys()) - set(truth.keys()))
         
     print("\n======================= VALIDATION ========================")
-
     print(f"标准答案目录：{TRUTH_DIR}")
     print(f"预测输出目录：{pred_dir}")
-    print(f"误差准则：{args.crit}")
-    if missing_days:
-        print(f"缺失 day 输出：{', '.join(missing_days)}")
-    if day is None and extra_days:
-        print(f"预测多余 day（标准答案中不存在）：{', '.join(extra_days)}")
+    print(f"模式：{args.mode}")
+    if args.mode == "sense":
+        print(f"误差准则：{args.crit}")
 
-    def bold(text: str) -> str:
-        return f"\033[1m{text}\033[0m"
+    if args.mode == "form":
+        # 复刻老师示例脚本逻辑：对每个因子，逐日求 sum_t e_t，再对 day 做 average，并与 0.01 比较。
+        # 注意：form 模式下忽略 --crit/--plot 等增强参数，仅输出 True/False。
+        import math
 
-    def fmt_mean_err(value: float) -> str:
-        return "0" if value == 0.0 else f"{value:.2e}"
+        def zfill6(t: str) -> str:
+            tt = t.strip()
+            return tt.zfill(6)
 
-    def cell_tag(ok: bool) -> str:
-        return "[P]" if ok else f"[{bold('F')}]"
+        def in_window(tt: str) -> bool:
+            # 老师脚本的窗口：093000 ~ 145700
+            return "093000" <= tt <= "145700"
+
+        def load_day_rows(day_str: str, root_dir: str) -> Dict[str, List[float]]:
+            # 读取 <root_dir>/<day>.csv 或 <root_dir>/<day>.csv-r-00000*（root_dir=pred_dir 时）
+            # 对 pred：可能有多个分片，合并为一个 dict（以第一次出现的为准）。
+            candidates: List[str] = []
+            exact = os.path.join(root_dir, f"{day_str}.csv")
+            if os.path.isfile(exact):
+                candidates = [exact]
+            else:
+                candidates = sorted(glob.glob(os.path.join(root_dir, f"{day_str}.csv-r-*")))
+            if not candidates:
+                return {}
+            merged: Dict[str, List[float]] = {}
+            for p in candidates:
+                data = read_day_csv(p).rows
+                for k, v in data.items():
+                    merged.setdefault(k, v)
+            # 与老师脚本对齐：索引统一补齐到 6 位字符串
+            return {zfill6(k): v for k, v in merged.items()}
+
+        days = [day] if day is not None else sorted(truth.keys())
+        try:
+            import numpy as np
+        except Exception as e:
+            raise SystemExit(f"form 模式需要 numpy：{e}")
+
+        day_sums: List["np.ndarray"] = []
+        invalid = False
+        for d in days:
+            std_rows_raw = truth.get(d).rows if d in truth else {}
+            std_rows = {zfill6(k): v for k, v in std_rows_raw.items()}
+            pred_rows = load_day_rows(d, pred_dir)
+
+            std_times = sorted([t for t in std_rows.keys() if in_window(t)])
+            pred_times = sorted([t for t in pred_rows.keys() if in_window(t)])
+            if std_times != pred_times:
+                invalid = True
+                break
+
+            std_mat = np.asarray([std_rows[t] for t in std_times], dtype=np.float64)  # (M,20)
+            pred_mat = np.asarray([pred_rows[t] for t in pred_times], dtype=np.float64)  # (M,20)
+            e_mat = np.abs(std_mat - pred_mat) / np.abs(std_mat + 1e-7)  # (M,20)
+            day_sums.append(e_mat.sum(axis=0))  # (20,)
+
+        if invalid or not day_sums:
+            avg_err = np.full((FACTOR_COUNT,), np.nan, dtype=np.float64)
+        else:
+            avg_err = np.mean(np.stack(day_sums, axis=0), axis=0)  # (20,)
+
+        all_ok = True
+        for i in range(1, FACTOR_COUNT + 1):
+            v = float(avg_err[i - 1])
+            ok = (not math.isnan(v)) and v < THRESHOLD
+            print(f"alpha_{i}: {ok}  err={fmt_metric(v) if not math.isnan(v) else 'nan'}")
+            all_ok = all_ok and ok
+
+        return 0 if all_ok else 2
 
     # 逐天评估：为表格/绘图提供输入。
     day_results: Dict[str, EvalResult] = {}
@@ -590,64 +671,12 @@ def main(argv: List[str]) -> int:
         if pred_day is None:
             continue
         day_results[d] = evaluate_day(truth[d], pred_day, eps=args.eps)
-
-    # 输出：DataFrame（index=因子，columns=day）
-    try:
-        import pandas as pd
-    except Exception as e:
-        raise SystemExit(f"需要 pandas 才能输出 DataFrame：{e}")
-
-    factor_index = [f"alpha_{i:02d}" for i in range(1, FACTOR_COUNT + 1)]
-    columns: Dict[str, List[str]] = {}
-    for d in sorted(day_results.keys()):
-        r = day_results[d]
-        metric_values = _metric_values(r, args.crit)
-        day_has_fail = (
-            any(err > THRESHOLD for err in metric_values)
-            or r.missing_pred_points > 0
-            or r.missing_truth_points > 0
-        )
-        col_label = f"{cell_tag(not day_has_fail)} {d}"
-        col_values: List[str] = []
-        for metric in metric_values:
-            ok = metric <= THRESHOLD
-            col_values.append(f"{cell_tag(ok)} {fmt_mean_err(metric)}")
-        columns[col_label] = col_values
-
-    df = pd.DataFrame(columns, index=factor_index)
-    pd.set_option("display.width", 200)
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.max_rows", None)
-    pd.set_option("display.max_colwidth", None)
-    print("\n--------------------- FACTOR TABLE ---------------------")
-
-    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
-
-    def visible_len(s: str) -> int:
-        return len(ansi_re.sub("", s))
-
-    def ljust_visible(s: str, width: int) -> str:
-        pad = max(0, width - visible_len(s))
-        return s + (" " * pad)
-
-    index_width = max((visible_len(str(x)) for x in df.index), default=0)
-    col_widths: Dict[str, int] = {}
-    for col in df.columns:
-        values = [str(v) for v in df[col].tolist()]
-        col_widths[str(col)] = max([visible_len(str(col))] + [visible_len(v) for v in values])
-
-    index_header = "fctr/day"
-    header_cells = [ljust_visible(index_header, index_width)]
-    for col in df.columns:
-        header_cells.append(ljust_visible(str(col), col_widths[str(col)]))
-    print("  ".join(header_cells).rstrip())
-
-    for idx in df.index:
-        row_cells = [ljust_visible(str(idx), index_width)]
-        for col in df.columns:
-            cell = str(df.at[idx, col])
-            row_cells.append(ljust_visible(cell, col_widths[str(col)]))
-        print("  ".join(row_cells).rstrip())
+    print_factor_table(
+        day_results=day_results,
+        crit=args.crit,
+        missing_days=missing_days,
+        extra_days=extra_days if day is None else [],
+    )
 
     all_days_ok = True
     for d in truth.keys():
@@ -679,24 +708,10 @@ def main(argv: List[str]) -> int:
 
         if day is not None:
             day_result = day_results[day]
-            maybe_plot_histograms(
-                plot_dir=plot_root,
-                threshold=THRESHOLD,
-                metric_values=_metric_values(day_result, args.crit),
-                per_factor_errors=day_result.factor_errors,
-                mode=args.plot,
-                crit=args.crit,
-            )
+            maybe_plot_histograms(plot_dir=plot_root, threshold=THRESHOLD, metric_values=_metric_values(day_result, args.crit), per_factor_errors=day_result.factor_errors, mode=args.plot, crit=args.crit)
         else:
             for d, day_result in day_results.items():
-                maybe_plot_histograms(
-                    plot_dir=os.path.join(plot_root, d),
-                    threshold=THRESHOLD,
-                    metric_values=_metric_values(day_result, args.crit),
-                    per_factor_errors=day_result.factor_errors,
-                    mode=args.plot,
-                    crit=args.crit,
-                )
+                maybe_plot_histograms(plot_dir=os.path.join(plot_root, d), threshold=THRESHOLD, metric_values=_metric_values(day_result, args.crit), per_factor_errors=day_result.factor_errors, mode=args.plot, crit=args.crit)
         print(f"直方图已输出到：{plot_root}")
     all_ok = all_days_ok
     return 0 if all_ok else 2

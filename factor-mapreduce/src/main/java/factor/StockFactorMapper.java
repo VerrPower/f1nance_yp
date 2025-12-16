@@ -19,6 +19,7 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
 
     private Snapshot lastSnapshot = null;
     private final DayTimeKey outKey = new DayTimeKey();
+    private final FactorWritable outValue = new FactorWritable();
 
     @Override
     protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
@@ -27,44 +28,27 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
         // Skip header or empty lines
         if (line.startsWith("tradingDay") || line.trim().isEmpty()) {
             return;
+        } 
+
+        Snapshot currentSnapshot = Snapshot.parse(line);
+
+        // 换日：t-1 只能在同一交易日内定义，必须清空。
+        if (lastSnapshot != null && lastSnapshot.tradingDay != currentSnapshot.tradingDay) {
+            lastSnapshot = null;
         }
 
-        try {
-            Snapshot currentSnapshot = Snapshot.parse(line);
-            
-            // Ensure we are processing the same stock sequence. 
-            // Since input splits are typically per-file and files are per-stock, 
-            // we assume sequential processing. 
-            // However, if we switch stocks (unlikely in one file), we should reset.
-            // But here we just implement the logic as if the stream is continuous for one stock.
-            // If the file contains multiple stocks mixed, this logic would be flawed, 
-            // but the problem description implies per-stock files.
-            
-            // Check for day change or stock change if necessary? 
-            // The prompt says "For each day...". 
-            // If a file spans multiple days, we might need to reset on day change.
-            if (lastSnapshot != null && lastSnapshot.tradingDay != currentSnapshot.tradingDay) {
-                // 换日：t-1 只能在同一交易日内定义，必须清空。
-                lastSnapshot = null;
-            }
+        // 计算 20 个因子：上一条快照用于 alpha_17/18/19。
+        Snapshot.computeInto(currentSnapshot, lastSnapshot, outValue.factors);
 
-            // 计算 20 个因子：上一条快照用于 alpha_17/18/19。
-            double[] factors = Snapshot.compute(currentSnapshot, lastSnapshot);
-
-            // 注意：即使不输出该条记录，也要维护 lastSnapshot，
-            // 因为 09:30:00 的 t-1 可能来自 09:29:57（在输出窗口之外）。
-            if (shouldEmit(currentSnapshot.tradeTime)) {
-                outKey.set(currentSnapshot.tradingDay, currentSnapshot.tradeTime);
-                context.write(outKey, new FactorWritable(factors));
-            }
-
-            // 更新 t-1
-            lastSnapshot = currentSnapshot;
-
-        } catch (Exception e) {
-            // Log error or ignore bad records
-            System.err.println("Error parsing line: " + line + " - " + e.getMessage());
+        // 注意：即使不输出该条记录，也要维护 lastSnapshot，
+        // 因为 09:30:00 的 t-1 可能来自 09:29:57（在输出窗口之外）。
+        if (shouldEmit(currentSnapshot.tradeTime)) {
+            outKey.set(currentSnapshot.tradingDay, currentSnapshot.tradeTime);
+            context.write(outKey, outValue);
         }
+
+        // 更新 t-1
+        lastSnapshot = currentSnapshot;
     }
 
     private static boolean shouldEmit(long tradeTime) {
