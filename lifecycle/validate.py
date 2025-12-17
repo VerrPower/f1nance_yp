@@ -31,7 +31,7 @@ BASE_DIR = "/home/pogi/FINANCE_for_YP"
 TRUTH_DIR = os.path.join(BASE_DIR, "std_ref")
 BUFFER_ROOT = os.path.join(BASE_DIR, "local_buffer", "hdfs_out")
 
-DAY_FILE_RE = re.compile(r"^(?P<day>\d{4})\.csv(?:-r-\d+)?$")
+DAY_FILE_RE = re.compile(r"^(?P<day>\d{4})\.csv(?:-[rm]-\d+)?$")
 
 
 def bold(text: str) -> str:
@@ -102,9 +102,11 @@ def get_data(path: str, day: str) -> pd.DataFrame:
     if os.path.isfile(direct):
         paths = [direct]
     else:
-        paths = sorted(glob.glob(os.path.join(path, f"{day}.csv-r-*")))
+        paths = sorted(glob.glob(os.path.join(path, f"{day}.csv-r-*"))) + sorted(
+            glob.glob(os.path.join(path, f"{day}.csv-m-*"))
+        )
     if not paths:
-        raise FileNotFoundError(f"缺失 day 输出：{path}/{day}.csv(-r-*)")
+        raise FileNotFoundError(f"缺失 day 输出：{path}/{day}.csv(-r-*|-m-*)")
 
     dfs = [_read_one_csv(p) for p in paths]
     df = pd.concat(dfs, axis=0)

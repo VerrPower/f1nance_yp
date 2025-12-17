@@ -2,7 +2,9 @@ package factor;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.ShortWritable;
@@ -24,6 +26,7 @@ import org.apache.hadoop.mapreduce.lib.input.LineRecordReader;
  */
 public final class FixedCombineTextInputFormat extends CombineFileInputFormat<ShortWritable, Text> {
     public static final int MAX_FILES = 300;
+    private static final boolean PRINT_SPLIT_PLAN = false;
 
     static {
         System.out.printf("@ FixedCombineTextInputFormat: maxFiles=%d%n", MAX_FILES);
@@ -46,30 +49,44 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
         List<FileStatus> files = listStatus(job);
         List<InputSplit> splits = new ArrayList<>();
 
-        List<Path> groupPaths = new ArrayList<>();
-        List<Long> groupLengths = new ArrayList<>();
-        int splitIndex = 0;
-
+        // 关键保证：split 不跨交易日（map-only 需要“一天=一个 mapper”以在 mapper 内完成 300股截面平均）。
+        // 路径结构期望：.../<day>/<stock>/snapshot.csv
+        Map<String, DayGroup> byDay = new LinkedHashMap<>();
         for (FileStatus stat : files) {
-            if (stat.isDirectory()) {
-                continue;
+            if (stat.isDirectory()) continue;
+            Path path = stat.getPath();
+            String day = dayFromSnapshotPath(path);
+            DayGroup g = byDay.get(day);
+            if (g == null) {
+                g = new DayGroup();
+                byDay.put(day, g);
             }
-            groupPaths.add(stat.getPath());
-            groupLengths.add(stat.getLen());
-            if (groupPaths.size() >= MAX_FILES) {
-                debugPrintGroup(splitIndex++, groupPaths);
-                splits.add(makeSplit(groupPaths, groupLengths));
-                groupPaths.clear();
-                groupLengths.clear();
-            }
+            g.paths.add(path);
+            g.lengths.add(stat.getLen());
         }
 
-        if (!groupPaths.isEmpty()) {
-            debugPrintGroup(splitIndex++, groupPaths);
-            splits.add(makeSplit(groupPaths, groupLengths));
+        int splitIndex = 0;
+        for (Map.Entry<String, DayGroup> e : byDay.entrySet()) {
+            DayGroup g = e.getValue();
+            int n = g.paths.size();
+            for (int i = 0; i < n; i += MAX_FILES) {
+                int j = Math.min(i + MAX_FILES, n);
+                List<Path> groupPaths = new ArrayList<>(g.paths.subList(i, j));
+                List<Long> groupLengths = new ArrayList<>(g.lengths.subList(i, j));
+                if (PRINT_SPLIT_PLAN) {
+                    debugPrintGroup(splitIndex, groupPaths);
+                }
+                splits.add(makeSplit(groupPaths, groupLengths));
+                splitIndex++;
+            }
         }
 
         return splits;
+    }
+
+    private static final class DayGroup {
+        final List<Path> paths = new ArrayList<>();
+        final List<Long> lengths = new ArrayList<>();
     }
 
     private static void debugPrintGroup(int splitIndex, List<Path> groupPaths) {
