@@ -33,9 +33,21 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
     private double prevBp1 = 0.0;
     private double prevSumBidVolumes = 0.0;
     private double prevSumAskVolumes = 0.0;
+    private long prevTradeTime = Long.MIN_VALUE;
+    private long prevFileId = Long.MIN_VALUE;
 
     @Override
     protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+        // CombineFileInputFormat 下一个 mapper 会处理多个文件；alpha_17/18/19 的 t-1 必须在“同一股票文件”内定义。
+        // FixedCombineTextInputFormat 将 fileIndex 编码到输入 key 的高位：这里据此在文件切换时清空 t-1 状态。
+        final long fileId = (key.get() >>> 48);
+        if (prevFileId != fileId) {
+            prevFileId = fileId;
+            hasPrev = false;
+            prevTradingDay = Long.MIN_VALUE;
+            prevTradeTime = Long.MIN_VALUE;
+        }
+
         // 进一步避免 Text->String 分配：直接在 byte[] 上做 ASCII 解析。
         final int n = value.getLength();
         if (n <= 0) {
@@ -57,15 +69,19 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
         // -------------------- 1) 解析必要字段（只读前 5 档） --------------------
         // field 0/1：data_fix 行首为 YYYYMMDD,HHMMSS,
         final int tradingDay = parseFixed8Digits(s, 0);
-        final int tradeTime = parseFixed6Digits(s, 9);
+        final int secOfDay = parseFixed6DigitsToSecOfDay(s, 9);
         int pos = 16; // 8 + ',' + 6 + ','
 
         // 换日：t-1 只能在同一交易日内定义，必须清空。
         if (hasPrev && prevTradingDay != tradingDay) {
             hasPrev = false;
         }
+        // Combine 可能让一个 mapper 处理多个文件，时间戳会“跳回早期”；遇到 tradeTime 逆序时清空 t-1。
+        if (hasPrev && secOfDay < prevTradeTime) {
+            hasPrev = false;
+        }
 
-        final boolean emit = shouldEmit(tradeTime);
+        final boolean emit = shouldEmit(secOfDay);
 
         // skip fields 2..11（10 个字段）
         for (int k = 0; k < 10; k++) {
@@ -206,6 +222,7 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
             prevBp1 = bp1;
             prevSumBidVolumes = sumBidVolumes;
             prevSumAskVolumes = sumAskVolumes;
+            prevTradeTime = secOfDay;
             return;
         }
 
@@ -265,7 +282,7 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
         // -------------------- 3) 输出与更新 t-1 状态 --------------------
         // 注意：即使不输出该条记录，也要维护 t-1 状态，
         // 因为 09:30:00 的 t-1 可能来自 09:29:57（在输出窗口之外）。
-        outKey.set(tradingDay, tradeTime);
+        outKey.set(tradingDay, secOfDay);
         context.write(outKey, outValue);
 
         // 更新 t-1（仅保留必要统计量）
@@ -275,13 +292,12 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
         prevBp1 = bp1;
         prevSumBidVolumes = sumBidVolumes;
         prevSumAskVolumes = sumAskVolumes;
+        prevTradeTime = secOfDay;
     }
 
-    private static boolean shouldEmit(long tradeTime) {
+    private static boolean shouldEmit(int secOfDay) {
         // 标准答案输出时间窗口：9:30:00~11:30:00 + 13:00:00~15:00:00（含端点）。
-        // tradeTime 在输入 CSV 中通常是 6 位 HHmmss（例如 093000），parse 成 long 后会变为 93000（前导零丢失）。
-        return (tradeTime >= 93_000L && tradeTime <= 113_000L)
-                || (tradeTime >= 130_000L && tradeTime <= 150_000L);
+        return (secOfDay >= 34_200 && secOfDay <= 41_400) || (secOfDay >= 46_800 && secOfDay <= 54_000);
     }
 
     private static int parseFixed8Digits(byte[] s, int pos) {
@@ -296,13 +312,10 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
         return v;
     }
 
-    private static int parseFixed6Digits(byte[] s, int pos) {
-        int v = s[pos] - '0';
-        v = v * 10 + (s[pos + 1] - '0');
-        v = v * 10 + (s[pos + 2] - '0');
-        v = v * 10 + (s[pos + 3] - '0');
-        v = v * 10 + (s[pos + 4] - '0');
-        v = v * 10 + (s[pos + 5] - '0');
-        return v;
+    private static int parseFixed6DigitsToSecOfDay(byte[] s, int pos) {
+        int hh = (s[pos] - '0') * 10 + (s[pos + 1] - '0');
+        int mm = (s[pos + 2] - '0') * 10 + (s[pos + 3] - '0');
+        int ss = (s[pos + 4] - '0') * 10 + (s[pos + 5] - '0');
+        return hh * 3600 + mm * 60 + ss;
     }
 }

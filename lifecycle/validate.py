@@ -2,719 +2,193 @@
 # -*- coding: utf-8 -*-
 
 """
-对 MapReduce 输出的因子均值序列进行“准确性测试”校验（忽略 Pearson IC）。
-
-评分规则：
-对每个因子 i，在所有交易日的所有时刻 t 上计算
-    e_t = |x_t - x'_t| / |x'_t|
-并可选择汇总准则（由 --crit 控制）：
-    - mean：e_i^{mean} = (1/|T|) * sum_{t∈T} e_t
-    - max ：e_i^{max} = max_t e_t
-若汇总误差 <= 0.01（1%）则该因子判定为正确。
-
-本脚本约定：
-- 标准答案目录优先使用仓库根目录下的 `std_red/`；若不存在则回退到 `std_ref/`
-- 预测输出从本地缓冲目录自动发现：`local_buffer/hdfs_out/`
-
-校验模式：
-- 指定 `--day 0108`：只校验单天（0108），并自动定位包含 0108 输出文件的最新目录
-- 不指定 `--day`：自动选择包含输出文件的最新目录，尝试校验 std_red 中全部交易日；
-  对缺失的 day 输出会打印出来。
-
-校验口径（由 --mode 控制）：
-- sense：默认口径（本脚本的“按点误差 + 汇总准则 --crit”），支持绘图等增强功能
-- form：复刻老师给的示例脚本口径（更轻量，仅打印 True/False；忽略 --crit/--plot 等增强参数）
-
-误差分布直方图：
-- 通过 `--plot` 控制：不画/只画不通过因子/画全部因子
-- 若指定 `--day`：输出到 `err_distr_out/plot_<day>/`（目录存在则先删除重建）
-- 不指定 `--day`：输出到 `err_distr_out/plot_ALL/`（目录存在则先删除重建）
-- 图片名为 `alpha_xx-因子名称.png`
+以老师提供的 pandas/numpy 版本为核心逻辑：
+- 对每个因子 alpha_i，在每个交易日上计算：
+    err_day = sum_t |std(t) - pred(t)| / |std(t) + eps|
+  再对所有交易日取平均：
+    err = average(err_day)
+- err < 0.01 判定通过
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import glob
 import os
 import re
-import shutil
 import sys
-import warnings
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 
 
 FACTOR_COUNT = 20
 THRESHOLD = 0.01
+FACTOR_COLS = [f"alpha_{i}" for i in range(1, FACTOR_COUNT + 1)]
 
-FACTOR_NAMES: Dict[int, str] = {
-    1: "最优价差",
-    2: "相对价差",
-    3: "中间价",
-    4: "买一不平衡",
-    5: "前5档多档不平衡",
-    6: "前5档买方深度",
-    7: "前5档卖方深度",
-    8: "买卖深度差",
-    9: "买卖深度比",
-    10: "全市场买卖量平衡指数",
-    11: "前5档买方加权价格",
-    12: "前5档卖方加权价格",
-    13: "综合加权中价",
-    14: "买卖加权价差",
-    15: "每档平均挂单量差",
-    16: "买卖不对称度",
-    17: "最优价变动",
-    18: "中间价变动",
-    19: "深度比变动",
-    20: "价压指标",
-}
-
-
-def repo_root() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-
-def _pick_truth_dir() -> str:
-    root = repo_root()
-    cand = os.path.join(root, "std_red")
-    if os.path.isdir(cand):
-        return cand
-    return os.path.join(root, "std_ref")
-
-
-TRUTH_DIR = _pick_truth_dir()
-BUFFER_ROOT = os.path.join(repo_root(), "local_buffer", "hdfs_out")
-ERR_DISTR_OUT_ROOT = os.path.join(repo_root(), "err_distr_out")
-FONT_PATH = os.path.join(repo_root(), "factor-mapreduce", "fonts", "NotoSansCJKsc-Regular.otf")
+BASE_DIR = "/home/pogi/FINANCE_for_YP"
+TRUTH_DIR = os.path.join(BASE_DIR, "std_ref")
+BUFFER_ROOT = os.path.join(BASE_DIR, "local_buffer", "hdfs_out")
 
 DAY_FILE_RE = re.compile(r"^(?P<day>\d{4})\.csv(?:-r-\d+)?$")
-
-
-@dataclass(frozen=True)
-class DayData:
-    rows: Dict[str, List[float]]
-
-
-def _is_header_row(row: List[str]) -> bool:
-    return bool(row) and row[0].strip() == "tradeTime"
-
-
-def read_day_csv(path: str) -> DayData:
-    rows: Dict[str, List[float]] = {}
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.reader(f)
-        for raw in reader:
-            if not raw or all(not c.strip() for c in raw):
-                continue
-            if _is_header_row(raw):
-                continue
-            if len(raw) != 1 + FACTOR_COUNT:
-                raise ValueError(f"{path}: 列数不正确，期望 {1+FACTOR_COUNT}，实际 {len(raw)}")
-            trade_time = raw[0].strip()
-            values = [float(x) for x in raw[1:]]
-            rows[trade_time] = values
-    return DayData(rows=rows)
-
-
-def read_truth_dir(truth_dir: str) -> Dict[str, DayData]:
-    result: Dict[str, DayData] = {}
-    for path in sorted(glob.glob(os.path.join(truth_dir, "*.csv"))):
-        base = os.path.basename(path)
-        m = re.match(r"^(\d{4})\.csv$", base)
-        if not m:
-            continue
-        day = m.group(1)
-        result[day] = read_day_csv(path)
-    if not result:
-        raise ValueError(f"未在标准答案目录找到 *.csv：{truth_dir}")
-    return result
-
-
-def list_days_in_pred_dir(pred_dir: str) -> Dict[str, List[str]]:
-    grouped: Dict[str, List[str]] = {}
-    for path in sorted(glob.glob(os.path.join(pred_dir, "*"))):
-        base = os.path.basename(path)
-        m = DAY_FILE_RE.match(base)
-        if not m:
-            continue
-        day = m.group("day")
-        grouped.setdefault(day, []).append(path)
-    return grouped
-
-
-def read_pred_dir(pred_dir: str) -> Dict[str, DayData]:
-    grouped = list_days_in_pred_dir(pred_dir)
-    if not grouped:
-        raise ValueError(f"未在预测输出目录找到形如 0102.csv-r-00000 的文件：{pred_dir}")
-    result: Dict[str, DayData] = {}
-    for day, paths in grouped.items():
-        merged: Dict[str, List[float]] = {}
-        for p in paths:
-            data = read_day_csv(p)
-            for t, v in data.rows.items():
-                merged.setdefault(t, v)
-        merged_sorted = {k: merged[k] for k in sorted(merged.keys())}
-        result[day] = DayData(rows=merged_sorted)
-    return result
-
-
-def find_latest_pred_dir_for_day(day: str) -> Optional[str]:
-    if not os.path.isdir(BUFFER_ROOT):
-        return None
-    candidates: List[Tuple[float, str]] = []
-
-    def consider_dir(d: str) -> None:
-        grouped = list_days_in_pred_dir(d)
-        if day not in grouped:
-            return
-        newest = 0.0
-        for p in grouped[day]:
-            try:
-                newest = max(newest, os.path.getmtime(p))
-            except OSError:
-                continue
-        if newest > 0:
-            candidates.append((newest, d))
-
-    consider_dir(BUFFER_ROOT)
-    for name in os.listdir(BUFFER_ROOT):
-        p = os.path.join(BUFFER_ROOT, name)
-        if os.path.isdir(p):
-            consider_dir(p)
-    if not candidates:
-        return None
-    candidates.sort()
-    return candidates[-1][1]
-
-
-def find_latest_pred_dir_any() -> Optional[str]:
-    if not os.path.isdir(BUFFER_ROOT):
-        return None
-    candidates: List[Tuple[float, str]] = []
-
-    def consider_dir(d: str) -> None:
-        grouped = list_days_in_pred_dir(d)
-        if not grouped:
-            return
-        newest = 0.0
-        for paths in grouped.values():
-            for p in paths:
-                try:
-                    newest = max(newest, os.path.getmtime(p))
-                except OSError:
-                    continue
-        if newest > 0:
-            candidates.append((newest, d))
-
-    consider_dir(BUFFER_ROOT)
-    for name in os.listdir(BUFFER_ROOT):
-        p = os.path.join(BUFFER_ROOT, name)
-        if os.path.isdir(p):
-            consider_dir(p)
-    if not candidates:
-        return None
-    candidates.sort()
-    return candidates[-1][1]
-
-
-def normalize_day(day: str) -> str:
-    d = day.strip()
-    if not re.match(r"^\d{4}$", d):
-        raise ValueError(f"day 格式应为 4 位数字（如 0108），实际：{day!r}")
-    return d
-
-
-@dataclass
-class EvalResult:
-    factor_mean_errors: List[float]
-    factor_max_errors: List[float]
-    factor_errors: List[List[float]]
-    matched_points: int
-    missing_pred_points: int
-    missing_truth_points: int
-    zero_denom_points: int
-
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def bold(text: str) -> str:
     return f"\033[1m{text}\033[0m"
 
 
-def visible_len(text: str) -> int:
-    return len(ANSI_RE.sub("", text))
-
-
-def ljust_visible(text: str, width: int) -> str:
-    pad = max(0, width - visible_len(text))
-    return text + (" " * pad)
-
-
 def fmt_metric(value: float) -> str:
     return "0" if value == 0.0 else f"{value:.2e}"
 
 
-def cell_tag(ok: bool) -> str:
-    return "[P]" if ok else f"[{bold('F')}]"
+def list_days_in_dir(path: str) -> List[str]:
+    days: List[str] = []
+    for p in glob.glob(os.path.join(path, "*.csv*")):
+        base = os.path.basename(p)
+        m = DAY_FILE_RE.match(base)
+        if not m:
+            continue
+        day = m.group("day")
+        if day not in days:
+            days.append(day)
+    days.sort()
+    return days
 
 
-def print_factor_table(
-    *,
-    day_results: Dict[str, "EvalResult"],
-    crit: str,
-    missing_days: List[str],
-    extra_days: List[str],
-) -> None:
-    factor_labels = [f"alpha_{i:02d}" for i in range(1, FACTOR_COUNT + 1)]
-    days = sorted(day_results.keys())
+def find_latest_pred_dir_any() -> Optional[str]:
+    if not os.path.isdir(BUFFER_ROOT):
+        return None
 
-    columns: List[Tuple[str, List[str]]] = []
+    candidates: List[Tuple[float, str]] = []
+
+    def consider_dir(d: str) -> None:
+        newest = 0.0
+        any_day = False
+        for p in glob.glob(os.path.join(d, "*")):
+            base = os.path.basename(p)
+            if not DAY_FILE_RE.match(base):
+                continue
+            any_day = True
+            try:
+                newest = max(newest, os.path.getmtime(p))
+            except OSError:
+                continue
+        if any_day and newest > 0.0:
+            candidates.append((newest, d))
+
+    consider_dir(BUFFER_ROOT)
+    for name in os.listdir(BUFFER_ROOT):
+        p = os.path.join(BUFFER_ROOT, name)
+        if os.path.isdir(p):
+            consider_dir(p)
+
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][1]
+
+
+def _read_one_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, index_col=0)
+    df.index = df.index.astype("str").str.zfill(6)
+    df = df[(df.index >= "093000") & (df.index <= "145700")]
+    return df
+
+
+def get_data(path: str, day: str) -> pd.DataFrame:
+    paths = []
+    direct = os.path.join(path, f"{day}.csv")
+    if os.path.isfile(direct):
+        paths = [direct]
+    else:
+        paths = sorted(glob.glob(os.path.join(path, f"{day}.csv-r-*")))
+    if not paths:
+        raise FileNotFoundError(f"缺失 day 输出：{path}/{day}.csv(-r-*)")
+
+    dfs = [_read_one_csv(p) for p in paths]
+    df = pd.concat(dfs, axis=0)
+    df = df[~df.index.duplicated(keep="first")]
+    df = df.sort_index()
+    return df
+
+
+def score(*, days: List[str], std_path: str, eval_path: str, eps: float) -> Tuple[bool, List[float]]:
+    all_ok = True
+    err_days: List[np.ndarray] = []
+
     for day in days:
-        r = day_results[day]
-        metric_values = _metric_values(r, crit)
-        day_has_fail = (
-            any(v > THRESHOLD for v in metric_values)
-            or r.missing_pred_points > 0
-            or r.missing_truth_points > 0
-        )
-        col_label = f"{cell_tag(not day_has_fail)} {day}"
-        col_values = [f"{cell_tag(v <= THRESHOLD)} {fmt_metric(v)}" for v in metric_values]
-        columns.append((col_label, col_values))
+        standard_df = get_data(std_path, day)
+        test_df = get_data(eval_path, day)
 
-    print("\n=========================== FACTOR TABLE ===========================")
-    index_header = "fctr/day"
-    index_width = max(visible_len(index_header), max((visible_len(x) for x in factor_labels), default=0))
-    col_widths = [max(visible_len(label), max((visible_len(v) for v in values), default=0)) for label, values in columns]
+        missing_cols = [c for c in FACTOR_COLS if c not in standard_df.columns or c not in test_df.columns]
+        if missing_cols:
+            raise ValueError(f"{day}: 缺失列：{', '.join(missing_cols)}")
 
-    header_cells = [ljust_visible(index_header, index_width)] + [
-        ljust_visible(label, w) for (label, _), w in zip(columns, col_widths)
-    ]
-    print("  ".join(header_cells).rstrip())
+        standard_df = standard_df[FACTOR_COLS]
+        test_df = test_df[FACTOR_COLS]
 
-    for row_i, factor in enumerate(factor_labels):
-        row = [ljust_visible(factor, index_width)]
-        for (_, values), w in zip(columns, col_widths):
-            row.append(ljust_visible(values[row_i], w))
-        print("  ".join(row).rstrip())
+        idx = standard_df.index.intersection(test_df.index)
+        if len(idx) != len(standard_df.index) or len(idx) != len(test_df.index):
+            all_ok = False
 
-    if missing_days:
-        print(f"\n缺失 day 输出：{', '.join(missing_days)}")
-    if extra_days:
-        print(f"预测多余 day（标准答案中不存在）：{', '.join(extra_days)}")
+        std_mat = standard_df.loc[idx].to_numpy(dtype=np.float64, copy=False)
+        pred_mat = test_df.loc[idx].to_numpy(dtype=np.float64, copy=False)
+        denom = np.abs(std_mat + eps)
+        err_day = np.sum(np.abs(std_mat - pred_mat) / denom, axis=0)
+        err_days.append(err_day)
 
+    if not err_days:
+        raise ValueError("没有任何可评估的 day")
 
-def evaluate_day(truth_day: DayData, pred_day: DayData, *, eps: float) -> EvalResult:
-    max_errors = [0.0] * FACTOR_COUNT
-    sum_errors = [0.0] * FACTOR_COUNT
-    per_factor: List[List[float]] = [[] for _ in range(FACTOR_COUNT)]
-    count = 0
-    missing_pred = 0
-    missing_truth = 0
-    zero_denom = 0
+    avg_errs = np.mean(np.stack(err_days, axis=0), axis=0)
+    for i, avg_err in enumerate(avg_errs.tolist(), start=1):
+        ok = avg_err < THRESHOLD
+        all_ok = all_ok and ok
+        print(f"alpha_{i}: {'PASS' if ok else 'FAIL'} err={fmt_metric(avg_err)}")
 
-    for t, truth_vals in truth_day.rows.items():
-        pred_vals = pred_day.rows.get(t)
-        if pred_vals is None:
-            missing_pred += 1
-            continue
-        count += 1
-        for i in range(FACTOR_COUNT):
-            denom = abs(truth_vals[i])
-            if denom == 0.0:
-                denom = eps
-                zero_denom += 1
-            e_t = abs(pred_vals[i] - truth_vals[i]) / denom
-            if e_t > max_errors[i]:
-                max_errors[i] = e_t
-            sum_errors[i] += e_t
-            per_factor[i].append(e_t)
-
-    for t in pred_day.rows.keys():
-        if t not in truth_day.rows:
-            missing_truth += 1
-
-    if count == 0:
-        raise ValueError("没有任何可对齐的 tradeTime 点，请检查输出路径与文件内容。")
-
-    mean_errors = [s / count for s in sum_errors]
-    return EvalResult(
-        factor_mean_errors=mean_errors,
-        factor_max_errors=max_errors,
-        factor_errors=per_factor,
-        matched_points=count,
-        missing_pred_points=missing_pred,
-        missing_truth_points=missing_truth,
-        zero_denom_points=zero_denom,
-    )
-
-def _metric_values(result: EvalResult, crit: str) -> List[float]:
-    c = (crit or "mean").lower()
-    if c == "mean":
-        return result.factor_mean_errors
-    if c == "max":
-        return result.factor_max_errors
-    raise ValueError(f"未知 --crit：{crit!r}（应为 mean/max）")
-
-
-def _metric_label(crit: str) -> str:
-    c = (crit or "mean").lower()
-    if c == "mean":
-        return "mean_error"
-    if c == "max":
-        return "max_error"
-    return "error"
-
-
-def maybe_plot_histograms(
-    *,
-    plot_dir: str,
-    threshold: float,
-    metric_values: List[float],
-    per_factor_errors: List[List[float]],
-    mode: str,
-    crit: str,
-) -> None:
-    mode = (mode or "none").lower()
-    if mode == "none":
-        return
-
-    try:
-        import tempfile
-
-        os.environ.setdefault("MPLCONFIGDIR", tempfile.mkdtemp(prefix="mplcfg_"))
-        import matplotlib
-
-        matplotlib.use("Agg")
-        try:
-            from matplotlib import font_manager as fm
-
-            if os.path.isfile(FONT_PATH):
-                fm.fontManager.addfont(FONT_PATH)
-                font_name = fm.FontProperties(fname=FONT_PATH).get_name()
-                matplotlib.rcParams["font.family"] = "sans-serif"
-                matplotlib.rcParams["font.sans-serif"] = [font_name, "DejaVu Sans", "Liberation Sans"]
-                matplotlib.rcParams["axes.unicode_minus"] = False
-        except Exception:
-            pass
-        warnings.filterwarnings("ignore", message=r".*Glyph.*missing from font.*", category=UserWarning)
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"警告：无法绘制直方图（未安装/不可用 matplotlib）：{e}")
-        return
-
-    if os.path.isdir(plot_dir):
-        shutil.rmtree(plot_dir)
-    os.makedirs(plot_dir, exist_ok=True)
-
-    only_reject = mode == "reject_only"
-
-    def sci_latex(value: float) -> str:
-        if value == 0.0:
-            return r"$0$"
-        import math
-
-        exp = int(math.floor(math.log10(abs(value))))
-        mant = value / (10**exp)
-        return rf"${mant:.2f}\times10^{{{exp}}}$"
-
-    for i in range(FACTOR_COUNT):
-        factor_id = i + 1
-        name = FACTOR_NAMES.get(factor_id, "")
-        metric = metric_values[i]
-        ok = metric <= threshold
-        if only_reject and ok:
-            continue
-
-        errors = per_factor_errors[i]
-        color = "C0" if ok else "C3"
-        status = "PASS" if ok else "FAIL"
-        title_base = f"alpha_{factor_id:02d}-{name}"
-        legend_label = f"{title_base}-{status}  {_metric_label(crit)}={sci_latex(metric)}"
-
-        out_path = os.path.join(plot_dir, f"{title_base}.png")
-
-        max_abs = max((abs(x) for x in errors), default=0.0)
-        is_all_zero = max_abs == 0.0
-
-        if is_all_zero:
-            from matplotlib.patches import FancyBboxPatch
-
-            fig, ax = plt.subplots(figsize=(7.2, 3.6))
-            ax.set_axis_off()
-            rect = FancyBboxPatch(
-                (0.1, 0.25),
-                0.8,
-                0.5,
-                boxstyle="round,pad=0.02,rounding_size=0.04",
-                transform=ax.transAxes,
-                facecolor="C0",
-                alpha=0.15,
-                edgecolor="C0",
-                linewidth=3.0,
-            )
-            ax.add_patch(rect)
-            ax.text(
-                0.5,
-                0.83,
-                f"[{title_base}]",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color="black",
-                fontsize=13,
-                fontweight="bold",
-            )
-            ax.text(
-                0.5,
-                0.5,
-                "PERFECT HIT",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color="C0",
-                fontsize=20,
-                fontweight="bold",
-            )
-            fig.tight_layout()
-            fig.savefig(out_path, dpi=160)
-            plt.close(fig)
-            continue
-
-        fig, ax = plt.subplots(figsize=(8, 4.5))
-        ax.hist(
-            errors,
-            bins=60,
-            color=color,
-            alpha=0.85,
-            edgecolor="white",
-            linewidth=0.5,
-            label=legend_label,
-        )
-        ax.axvline(threshold, color="black", linestyle="--", linewidth=1.0, label=f"拒绝阈值={threshold:g}")
-
-        min_v = min(errors)
-        max_v = max(errors)
-        if min_v == max_v:
-            span = max(abs(min_v) * 0.1, threshold * 0.1, 1e-12)
-            x_left = min_v - span
-            x_right = max_v + span
-        else:
-            data_range = max_v - min_v
-            pad = data_range * 0.125
-            x_left = min_v - pad
-            x_right = max_v + pad
-        ax.set_xlim(x_left, x_right)
-
-        ax.set_title(title_base)
-        ax.set_xlabel(r"$e_t = |x_t - x'_t| \,/\, |x'_t|$")
-        ax.set_ylabel("count")
-        ax.legend(loc="upper right")
-        ax.grid(True, axis="y", alpha=0.25)
-
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=160)
-        plt.close(fig)
+    return all_ok, avg_errs.tolist()
 
 
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--day", default=None, help="校验单天（如 0108）；留空则校验标准答案目录下全部天")
-    parser.add_argument(
-        "--mode",
-        default="form",
-        choices=["sense", "form"],
-        help="校验模式：sense=本脚本口径（默认）；form=老师示例脚本口径（轻量，仅打印 True/False）",
-    )
-    parser.add_argument(
-        "--crit",
-        default="mean",
-        choices=["mean", "max"],
-        help="误差汇总准则：mean=对所有时刻取平均；max=对所有时刻取最大值（默认 mean）",
-    )
-    parser.add_argument("--eps", type=float, default=1e-12, help="标准值为 0 时的分母替代值")
-    # 新参数名：--plot（保留 --err-distr 作为兼容别名）
-    parser.add_argument(
-        "--plot",
-        default="none",
-        choices=["none", "reject_only", "both"],
-        help="绘制误差分布直方图：none=不画；reject_only=只画不通过；both=全部因子",
-    )
-    parser.add_argument(
-        "--err-distr",
-        dest="plot",
-        choices=["none", "reject_only", "both"],
-        help=argparse.SUPPRESS,
-    )
+    parser.add_argument("--eps", type=float, default=1e-7)
     args = parser.parse_args(argv)
 
-    # 本地缓冲目录：用于承接从 HDFS 拉回的输出（launch.py 会写入该目录）。
-    # validate 也会从这里自动发现最新输出；若目录不存在则主动创建，避免后续扫描时报错。
     os.makedirs(BUFFER_ROOT, exist_ok=True)
-    # 误差分布图输出根目录：若用户开启 --plot，需要保证根目录存在。
-    os.makedirs(ERR_DISTR_OUT_ROOT, exist_ok=True)
-
     if not os.path.isdir(TRUTH_DIR):
         raise SystemExit(f"未找到标准答案目录：{TRUTH_DIR}")
-    truth_all = read_truth_dir(TRUTH_DIR)
 
-    day: Optional[str] = None
-    if args.day is not None:
-        day = normalize_day(args.day)
+    pred_dir = find_latest_pred_dir_any()
+    if not pred_dir:
+        raise SystemExit(f"未找到预测输出目录：{BUFFER_ROOT}")
 
-    if day is not None:
-        pred_dir = find_latest_pred_dir_for_day(day)
-        if pred_dir is None:
-            raise SystemExit(f"未找到 day={day} 的预测输出（在 {BUFFER_ROOT} 下未发现 {day}.csv-r-*）")
-        if day not in truth_all:
-            raise SystemExit(f"标准答案中不存在 day={day}（请检查 {TRUTH_DIR}）")
-        truth = {day: truth_all[day]}
-        pred_all = read_pred_dir(pred_dir)
-        if day not in pred_all:
-            raise SystemExit(f"预测输出目录中未找到 day={day}（请检查 {pred_dir}）")
-        pred = {day: pred_all[day]}
-        missing_days: List[str] = []
-        extra_days: List[str] = []
-    else:
-        pred_dir = find_latest_pred_dir_any()
-        if pred_dir is None:
-            raise SystemExit(f"未找到任何预测输出（在 {BUFFER_ROOT} 下未发现 ????\\.csv-r-*）")
-        truth = truth_all
-        pred = read_pred_dir(pred_dir)
-        missing_days = sorted(set(truth.keys()) - set(pred.keys()))
-        extra_days = sorted(set(pred.keys()) - set(truth.keys()))
-        
+    truth_days = list_days_in_dir(TRUTH_DIR)
+    pred_days = list_days_in_dir(pred_dir)
+    missing_days = sorted(set(truth_days) - set(pred_days))
+    extra_days = sorted(set(pred_days) - set(truth_days))
+
     print("\n======================= VALIDATION ========================")
     print(f"标准答案目录：{TRUTH_DIR}")
     print(f"预测输出目录：{pred_dir}")
-    print(f"模式：{args.mode}")
-    if args.mode == "sense":
-        print(f"误差准则：{args.crit}")
+    print(f"预测输出目录名：{os.path.basename(pred_dir)}")
+    print("模式：form")
 
-    if args.mode == "form":
-        # 复刻老师示例脚本逻辑：对每个因子，逐日求 sum_t e_t，再对 day 做 average，并与 0.01 比较。
-        # 注意：form 模式下忽略 --crit/--plot 等增强参数，仅输出 True/False。
-        import math
+    days = truth_days
+    all_ok, _ = score(days=days, std_path=TRUTH_DIR, eval_path=pred_dir, eps=float(args.eps))
+    if missing_days:
+        print(f"缺失 day 输出：{', '.join(missing_days)}")
+        all_ok = False
+    if extra_days:
+        print(f"预测多余 day：{', '.join(extra_days)}")
+        all_ok = False
 
-        def zfill6(t: str) -> str:
-            tt = t.strip()
-            return tt.zfill(6)
-
-        def in_window(tt: str) -> bool:
-            # 老师脚本的窗口：093000 ~ 145700
-            return "093000" <= tt <= "145700"
-
-        def load_day_rows(day_str: str, root_dir: str) -> Dict[str, List[float]]:
-            # 读取 <root_dir>/<day>.csv 或 <root_dir>/<day>.csv-r-00000*（root_dir=pred_dir 时）
-            # 对 pred：可能有多个分片，合并为一个 dict（以第一次出现的为准）。
-            candidates: List[str] = []
-            exact = os.path.join(root_dir, f"{day_str}.csv")
-            if os.path.isfile(exact):
-                candidates = [exact]
-            else:
-                candidates = sorted(glob.glob(os.path.join(root_dir, f"{day_str}.csv-r-*")))
-            if not candidates:
-                return {}
-            merged: Dict[str, List[float]] = {}
-            for p in candidates:
-                data = read_day_csv(p).rows
-                for k, v in data.items():
-                    merged.setdefault(k, v)
-            # 与老师脚本对齐：索引统一补齐到 6 位字符串
-            return {zfill6(k): v for k, v in merged.items()}
-
-        days = [day] if day is not None else sorted(truth.keys())
-        try:
-            import numpy as np
-        except Exception as e:
-            raise SystemExit(f"form 模式需要 numpy：{e}")
-
-        day_sums: List["np.ndarray"] = []
-        invalid = False
-        for d in days:
-            std_rows_raw = truth.get(d).rows if d in truth else {}
-            std_rows = {zfill6(k): v for k, v in std_rows_raw.items()}
-            pred_rows = load_day_rows(d, pred_dir)
-
-            std_times = sorted([t for t in std_rows.keys() if in_window(t)])
-            pred_times = sorted([t for t in pred_rows.keys() if in_window(t)])
-            if std_times != pred_times:
-                invalid = True
-                break
-
-            std_mat = np.asarray([std_rows[t] for t in std_times], dtype=np.float64)  # (M,20)
-            pred_mat = np.asarray([pred_rows[t] for t in pred_times], dtype=np.float64)  # (M,20)
-            e_mat = np.abs(std_mat - pred_mat) / np.abs(std_mat + 1e-7)  # (M,20)
-            day_sums.append(e_mat.sum(axis=0))  # (20,)
-
-        if invalid or not day_sums:
-            avg_err = np.full((FACTOR_COUNT,), np.nan, dtype=np.float64)
-        else:
-            avg_err = np.mean(np.stack(day_sums, axis=0), axis=0)  # (20,)
-
-        all_ok = True
-        for i in range(1, FACTOR_COUNT + 1):
-            v = float(avg_err[i - 1])
-            ok = (not math.isnan(v)) and v < THRESHOLD
-            print(f"alpha_{i}: {ok}  err={fmt_metric(v) if not math.isnan(v) else 'nan'}")
-            all_ok = all_ok and ok
-
-        return 0 if all_ok else 2
-
-    # 逐天评估：为表格/绘图提供输入。
-    day_results: Dict[str, EvalResult] = {}
-    for d in sorted(truth.keys()):
-        pred_day = pred.get(d)
-        if pred_day is None:
-            continue
-        day_results[d] = evaluate_day(truth[d], pred_day, eps=args.eps)
-    print_factor_table(
-        day_results=day_results,
-        crit=args.crit,
-        missing_days=missing_days,
-        extra_days=extra_days if day is None else [],
-    )
-
-    all_days_ok = True
-    for d in truth.keys():
-        r = day_results.get(d)
-        if r is None:
-            all_days_ok = False
-            continue
-        if any(err > THRESHOLD for err in _metric_values(r, args.crit)):
-            all_days_ok = False
-        if r.missing_pred_points != 0 or r.missing_truth_points != 0:
-            all_days_ok = False
-    if missing_days or extra_days:
-        all_days_ok = False
-
-    if all_days_ok:
-        banner = "=" * 36
+    banner = "=" * 36
+    if all_ok:
         print(f"\n{banner}\n{bold('㊗️   CONGRATULATIONS! ALL PASS!  ㊗️')}\n{banner}")
-    else:
-        banner = "=" * 36
-        print(f"\n{banner}\n{bold('    Ohhh IT FUCKED UP!!!    ')}\n{banner}")
-
-    if args.plot != "none":
-        print("\n--------------------- PLOTS ---------------------")
-        print("开始打印误差分布直方图...")
-        plot_root = os.path.join(ERR_DISTR_OUT_ROOT, f"plot_{day}" if day is not None else "plot_ALL")
-        if os.path.isdir(plot_root):
-            shutil.rmtree(plot_root)
-        os.makedirs(plot_root, exist_ok=True)
-
-        if day is not None:
-            day_result = day_results[day]
-            maybe_plot_histograms(plot_dir=plot_root, threshold=THRESHOLD, metric_values=_metric_values(day_result, args.crit), per_factor_errors=day_result.factor_errors, mode=args.plot, crit=args.crit)
-        else:
-            for d, day_result in day_results.items():
-                maybe_plot_histograms(plot_dir=os.path.join(plot_root, d), threshold=THRESHOLD, metric_values=_metric_values(day_result, args.crit), per_factor_errors=day_result.factor_errors, mode=args.plot, crit=args.crit)
-        print(f"直方图已输出到：{plot_root}")
-    all_ok = all_days_ok
-    return 0 if all_ok else 2
+        return 0
+    print(f"\n{banner}\n{bold('    Ohhh IT FUCKED UP!!!    ')}\n{banner}")
+    return 2
 
 
 if __name__ == "__main__":

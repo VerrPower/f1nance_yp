@@ -19,8 +19,8 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
  *
  * <p><b>整体流水线架构：</b></p>
  * <ol>
- *   <li><b>InputFormat：</b>{@link NonSplittableTextInputFormat} 禁止切分单个股票 CSV 文件，
- *   确保 Mapper 内部维护的“上一条快照（t-1）”不因 split 边界丢失（影响 alpha_17/18/19）。</li>
+ *   <li><b>InputFormat：</b>{@link FixedCombineTextInputFormat} 组合多个 CSV 为一个 split（单文件不切分），
+ *   以减少 mapper 数量。</li>
  *   <li><b>Mapper：</b>{@link StockFactorMapper} 逐行解析 CSV（直接在 {@code byte[]} 上做 ASCII 扫描），计算 20 个因子，
  *   输出键为 {@link DayTimeKey}(tradingDay, tradeTime)，值为 {@link FactorWritable}(20 维因子向量“求和态”。)</li>
  *   <li><b>Combiner：</b>{@link FactorCombiner} 对同一个 (day,time) 的 value 做本地预聚合
@@ -39,7 +39,7 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
  *                 v
  *   +------------------------------+
  *   | InputFormat 读取文本行（CSV） |
- *   | NonSplittable：每个文件不切分 |
+ *   | Combine：多个文件合成一个 split |
  *   +------------------------------+
  *                 |
  *                 v
@@ -91,35 +91,12 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
  */
 public class Driver {
 
-    private static boolean parseBool(String value) {
-        if (value == null) throw new IllegalArgumentException("timing must be True/False");
-        String v = value.trim().toLowerCase(Locale.ROOT);
-        if ("true".equals(v) || "1".equals(v) || "yes".equals(v) || "y".equals(v)) return true;
-        if ("false".equals(v) || "0".equals(v) || "no".equals(v) || "n".equals(v)) return false;
-        throw new IllegalArgumentException("timing must be True/False, got: " + value);
-    }
-
     public static void main(String[] args) throws Exception {
-        boolean timingEnabled = false;
-        List<String> positional = new ArrayList<>();
-        for (int i = 0; i < args.length; i++) {
-            String arg = args[i];
-            if (arg.startsWith("--timing=")) {
-                timingEnabled = parseBool(arg.substring("--timing=".length()));
-                continue;
-            }
-            if ("--timing".equals(arg)) {
-                if (i + 1 >= args.length) {
-                    throw new IllegalArgumentException("--timing requires True/False");
-                }
-                timingEnabled = parseBool(args[++i]);
-                continue;
-            }
-            positional.add(arg);
-        }
+        System.out.println("@ Driver: Start timing");
+        final long startNs = System.nanoTime();
 
-        if (positional.size() != 2) {
-            System.err.println("Usage: Driver [--timing=True|False] <input path> <output path>");
+        if (args.length != 2) {
+            System.err.println("Usage: Driver <input path> <output path>");
             System.exit(-1);
         }
 
@@ -128,8 +105,8 @@ public class Driver {
         
         job.setJarByClass(Driver.class);
 
-        // 关键点：禁止 split，保证 t-1 因子在 mapper 内正确计算。
-        job.setInputFormatClass(NonSplittableTextInputFormat.class);
+        // Combine Input：多个 CSV 合为一个 split（单文件不切分），减少 mapper 数。
+        job.setInputFormatClass(FixedCombineTextInputFormat.class);
 
         // 固定 double（float 精度不满足 validate 门限，且提速不明显）。
         job.setMapperClass(StockFactorMapper.class);
@@ -150,23 +127,15 @@ public class Driver {
         // 关键点：输出只写 value（CSV 行），不写 key<TAB>value。
         job.setOutputFormatClass(ValueOnlyTextOutputFormat.class);
 
-        FileInputFormat.addInputPath(job, new Path(positional.get(0)));
-        FileOutputFormat.setOutputPath(job, new Path(positional.get(1)));
-
-        long startNs = 0L;
-        if (timingEnabled) {
-            System.out.println("@ Driver: Start timing");
-            startNs = System.nanoTime();
-        }
+        FileInputFormat.addInputPath(job, new Path(args[0]));
+        FileOutputFormat.setOutputPath(job, new Path(args[1]));
 
         boolean ok;
         try {
             ok = job.waitForCompletion(true);
         } finally {
-            if (timingEnabled) {
-                double sec = (System.nanoTime() - startNs) / 1_000_000_000.0;
-                System.out.printf(Locale.ROOT, "\n\n@ Driver: ElapsedSec: %.3f%n", sec);
-            }
+            double sec = (System.nanoTime() - startNs) / 1_000_000_000.0;
+            System.out.printf(Locale.ROOT, "\n\n@ Driver: ElapsedSec: %.3f%n", sec);
         }
         System.exit(ok ? 0 : 1);
     }

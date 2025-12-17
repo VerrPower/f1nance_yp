@@ -2,10 +2,11 @@ factor/AverageReducer.class
 factor/DayPartitioner.class
 factor/ValueOnlyTextOutputFormat$1.class
 factor/FactorWritable.class
-factor/NonSplittableTextInputFormat.class
+factor/FixedCombineTextInputFormat.class
 factor/DayTimeKey.class
 factor/Driver.class
 factor/StockFactorMapper.class
 factor/ValueOnlyTextOutputFormat.class
 factor/FactorCombiner.class
 factor/App.class
+factor/FixedCombineTextInputFormat$CFLineRecordReader.class

@@ -15,8 +15,8 @@ public final class DayPartitioner extends Partitioner<DayTimeKey, FactorWritable
         if (numPartitions <= 1) {
             return 0;
         }
-        long day = key == null ? 0L : key.getTradingDay();
-        // 仅依赖 tradingDay 做 hash，避免跨日聚合。
-        return (int) (Math.floorMod(day, numPartitions));
+        int dayCode = key == null ? 0 : key.getDayCode();
+        // 仅依赖 dayCode（yearOffset/month/day）做 hash，避免跨日聚合。
+        return Math.floorMod(dayCode, numPartitions);
     }
 }
