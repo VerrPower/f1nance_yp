@@ -22,8 +22,6 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
  *   以减少 mapper 数量。</li>
  *   <li><b>Mapper：</b>{@link StockFactorMapper} 逐行解析 CSV（直接在 {@code byte[]} 上做 ASCII 扫描），计算 20 个因子，
  *   输出键为 30-bit {@link IntWritable}（day+time 压缩后的 CompactTime），值为 {@link FactorWritable}(20 维因子向量“求和态”。)</li>
- *   <li><b>Combiner：</b>{@link FactorCombiner} 对同一个 (day,time) 的 value 做本地预聚合
- *   （逐维求和），减少 shuffle 传输量。</li>
  *   <li><b>Partitioner：</b>{@link DayPartitioner} 仅按 tradingDay 分区，避免不同日期混到同一个 reduce 分区。</li>
  *   <li><b>Reducer：</b>{@link AverageReducer} 计算每个 (day,time) 的 300股截面平均，
  *   并用 {@code MultipleOutputs} 按天输出 CSV（含表头）。</li>
@@ -109,7 +107,6 @@ public class Driver {
 
         // 固定 double（float 精度不满足 validate 门限，且提速不明显）。
         job.setMapperClass(StockFactorMapper.class);
-        job.setCombinerClass(FactorCombiner.class);
         job.setReducerClass(AverageReducer.class);
         job.setMapOutputKeyClass(IntWritable.class);
         job.setMapOutputValueClass(FactorWritable.class);

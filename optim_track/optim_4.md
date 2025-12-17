@@ -12,7 +12,7 @@
 
 改动：
 - `StockFactorMapper` 计算单行 20 因子后，不立刻 `context.write`，而是按 `compactTime30bits` 聚合到本地结构；
-- 在 `cleanup()` 一次性输出该 mapper 覆盖范围内的所有 `(day,time)` 聚合结果（求和态），交给 combiner/reducer 继续合并与最终平均。
+- 在 `cleanup()` 一次性输出该 mapper 覆盖范围内的所有 `(day,time)` 聚合结果（求和态），直接交给 reducer 合并与最终平均（combiner 已移除）。
 
 收益：
 - map-output records 从“快照行数级别”下降到“时间点级别”（每个 mapper 约 `4802` 条）。

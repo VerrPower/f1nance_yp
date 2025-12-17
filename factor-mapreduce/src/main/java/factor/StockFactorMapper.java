@@ -19,7 +19,7 @@ import java.io.IOException;
  *          只在行尾裁剪 {@code '\r'}。</li>
  *   <li><b>计算20个因子</b> : 
  *          解析前 5 档盘口与必要字段，计算 20 个因子；其中 {@code alpha_17/18/19} 依赖 t-1 状态。
- *          当检测到 fileId 变化、交易日变化或时间倒退时清空。</li>
+ *          当检测到 fileId 变化或时间倒退时清空。</li>
  *   <li><b>输出</b> : 
  *          {@code <IntWritable, FactorWritable>}：key 为 30-bit 
  *          {@code CompactTime30bits}（dayCode(15) | timeCode(15)），
@@ -51,7 +51,6 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
     
     // t-1 相关状态（只保存计算 alpha_17/18/19 所需的最少信息）。
     private boolean hasPrev = false;
-    private long prevTradingDay = Long.MIN_VALUE;
     private double prevAp1 = 0.0;
     private double prevBp1 = 0.0;
     private double prevSumBidVolumes = 0.0;
@@ -73,7 +72,6 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         if (prevFileId != fileId) {
             prevFileId = fileId;
             hasPrev = false;
-            prevTradingDay = Long.MIN_VALUE;
             prevTradeTime = Long.MIN_VALUE;
         }
 
@@ -95,9 +93,6 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         final int secOfDay = parseFixed6DigitsToSecOfDay(s, 9);
         int pos = 16; // 8 + ',' + 6 + ','
 
-        // 换日：t-1 只能在同一交易日内定义，必须清空。
-        if (hasPrev && prevTradingDay != tradingDay) hasPrev = false;
-        
         // Combine 可能让一个 mapper 处理多个文件，时间戳会“跳回早期”；遇到 tradeTime 逆序时清空 t-1。
         if (hasPrev && secOfDay < prevTradeTime) hasPrev = false;
         
@@ -229,7 +224,6 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         // 非输出窗口：不需要计算 20 因子，只更新 t-1 状态即可。
         if (!shouldEmit) {
             hasPrev = true;
-            prevTradingDay = tradingDay;
             prevAp1 = ap1;
             prevBp1 = bp1;
             prevSumBidVolumes = sumBidVolumes;
@@ -298,7 +292,6 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
 
         // 更新 t-1（仅保留必要统计量）
         hasPrev = true;
-        prevTradingDay = tradingDay;
         prevAp1 = ap1;
         prevBp1 = bp1;
         prevSumBidVolumes = sumBidVolumes;
