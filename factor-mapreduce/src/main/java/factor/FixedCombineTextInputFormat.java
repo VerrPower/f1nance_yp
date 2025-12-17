@@ -5,9 +5,10 @@ import java.util.ArrayList;
 import java.util.List;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.ShortWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.JobContext;
+import org.apache.hadoop.mapreduce.InputSplit;
 import org.apache.hadoop.mapreduce.RecordReader;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.lib.input.CombineFileInputFormat;
@@ -21,7 +22,7 @@ import org.apache.hadoop.mapreduce.lib.input.LineRecordReader;
  *
  * maxFiles 在类内硬编码为 {@link #MAX_FILES}：每个 mapper 处理的 csv 文件数上限。
  */
-public final class FixedCombineTextInputFormat extends CombineFileInputFormat<LongWritable, Text> {
+public final class FixedCombineTextInputFormat extends CombineFileInputFormat<ShortWritable, Text> {
     public static final int MAX_FILES = 300;
 
     static {
@@ -35,18 +36,19 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Lo
     }
 
     @Override
-    public RecordReader<LongWritable, Text> createRecordReader(org.apache.hadoop.mapreduce.InputSplit split, TaskAttemptContext ctx)
+    public RecordReader<ShortWritable, Text> createRecordReader(InputSplit split, TaskAttemptContext ctx)
             throws IOException {
-        return new CombineFileRecordReader<>((CombineFileSplit) split, ctx, CFLineRecordReader.class);
+        return new CombineFileRecordReader<>((CombineFileSplit) split, ctx, CombineFileLineRR.class);
     }
 
     @Override
-    public List<org.apache.hadoop.mapreduce.InputSplit> getSplits(JobContext job) throws IOException {
+    public List<InputSplit> getSplits(JobContext job) throws IOException {
         List<FileStatus> files = listStatus(job);
-        List<org.apache.hadoop.mapreduce.InputSplit> splits = new ArrayList<>();
+        List<InputSplit> splits = new ArrayList<>();
 
         List<Path> groupPaths = new ArrayList<>();
         List<Long> groupLengths = new ArrayList<>();
+        int splitIndex = 0;
 
         for (FileStatus stat : files) {
             if (stat.isDirectory()) {
@@ -55,6 +57,7 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Lo
             groupPaths.add(stat.getPath());
             groupLengths.add(stat.getLen());
             if (groupPaths.size() >= MAX_FILES) {
+                debugPrintGroup(splitIndex++, groupPaths);
                 splits.add(makeSplit(groupPaths, groupLengths));
                 groupPaths.clear();
                 groupLengths.clear();
@@ -62,13 +65,49 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Lo
         }
 
         if (!groupPaths.isEmpty()) {
+            debugPrintGroup(splitIndex++, groupPaths);
             splits.add(makeSplit(groupPaths, groupLengths));
         }
 
         return splits;
     }
 
-    private static org.apache.hadoop.mapreduce.InputSplit makeSplit(List<Path> paths, List<Long> lengths) {
+    private static void debugPrintGroup(int splitIndex, List<Path> groupPaths) {
+        if (groupPaths.isEmpty()) {
+            return;
+        }
+        String firstDay = dayFromSnapshotPath(groupPaths.get(0));
+        String lastDay = dayFromSnapshotPath(groupPaths.get(groupPaths.size() - 1));
+        boolean singleDay = true;
+        for (int i = 1; i < groupPaths.size(); i++) {
+            if (!firstDay.equals(dayFromSnapshotPath(groupPaths.get(i)))) {
+                singleDay = false;
+                break;
+            }
+        }
+        System.out.printf(
+                "@ SplitPlan #%d: files=%d singleDay=%s firstDay=%s lastDay=%s first=%s last=%s%n",
+                splitIndex,
+                groupPaths.size(),
+                singleDay ? "Y" : "N",
+                firstDay,
+                lastDay,
+                groupPaths.get(0),
+                groupPaths.get(groupPaths.size() - 1));
+    }
+
+    private static String dayFromSnapshotPath(Path snapshotPath) {
+        // Expect: .../<day>/<stock>/snapshot.csv
+        Path p = snapshotPath;
+        if (p == null) return "?";
+        p = p.getParent(); // stock
+        if (p == null) return "?";
+        p = p.getParent(); // day
+        if (p == null) return "?";
+        return p.getName();
+    }
+
+    private static InputSplit makeSplit(List<Path> paths, List<Long> lengths) {
         Path[] pArr = paths.toArray(new Path[0]);
         long[] start = new long[pArr.length];
         long[] lenArr = new long[pArr.length];
@@ -82,31 +121,22 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Lo
     /**
      * 针对 CombineFileSplit 的行读取器：内部用 LineRecordReader。
      */
-    public static class CFLineRecordReader extends RecordReader<LongWritable, Text> {
-        private final CombineFileSplit split;
+    public static class CombineFileLineRR extends RecordReader<ShortWritable, Text> {
         private final int index;
         private final LineRecordReader lineReader = new LineRecordReader();
-        private final LongWritable key = new LongWritable();
+        private final ShortWritable key = new ShortWritable();
 
-        // 将 fileIndex 编码进高位，供 Mapper 区分“当前记录来自哪个文件”（用于 t-1 状态隔离）。
-        // fileIndex 最大值通常远小于 2^16；低 48 位留给行偏移。
-        private static final int FILE_INDEX_SHIFT = 48;
-        private static final long OFFSET_MASK = (1L << FILE_INDEX_SHIFT) - 1L;
-
-        public CFLineRecordReader(CombineFileSplit split, TaskAttemptContext ctx, Integer index) throws IOException {
-            this.split = split;
+        public CombineFileLineRR(CombineFileSplit split, TaskAttemptContext attemptContext, Integer index) throws IOException {
             this.index = index;
-            initialize(new FileSplit(split.getPath(index), split.getOffset(index), split.getLength(index), split.getLocations()), ctx);
+            lineReader.initialize(
+                    new FileSplit(split.getPath(index), split.getOffset(index), split.getLength(index), split.getLocations()),
+                    attemptContext);
         }
 
         @Override
-        public void initialize(org.apache.hadoop.mapreduce.InputSplit genericSplit, TaskAttemptContext context)
+        public void initialize(InputSplit genericSplit, TaskAttemptContext attemptContext)
                 throws IOException {
             // no-op: 已在构造函数里初始化。
-        }
-
-        private void initialize(FileSplit fileSplit, TaskAttemptContext context) throws IOException {
-            lineReader.initialize(fileSplit, context);
         }
 
         @Override
@@ -114,13 +144,12 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Lo
             if (!lineReader.nextKeyValue()) {
                 return false;
             }
-            long offset = lineReader.getCurrentKey().get() & OFFSET_MASK;
-            key.set((((long) index) << FILE_INDEX_SHIFT) | offset);
+            key.set((short) index);
             return true;
         }
 
         @Override
-        public LongWritable getCurrentKey() {
+        public ShortWritable getCurrentKey() {
             return key;
         }
 

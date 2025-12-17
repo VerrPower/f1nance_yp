@@ -128,14 +128,13 @@ def score(*, days: List[str], std_path: str, eval_path: str, eps: float) -> Tupl
         standard_df = standard_df[FACTOR_COLS]
         test_df = test_df[FACTOR_COLS]
 
-        idx = standard_df.index.intersection(test_df.index)
-        if len(idx) != len(standard_df.index) or len(idx) != len(test_df.index):
-            all_ok = False
-
-        std_mat = standard_df.loc[idx].to_numpy(dtype=np.float64, copy=False)
-        pred_mat = test_df.loc[idx].to_numpy(dtype=np.float64, copy=False)
+        # 老师新版逻辑：用 outer 对齐；若缺点/重复点导致 NaN，则误差会变成 NaN，最终 FAIL。
+        standard_df, test_df = standard_df.align(test_df, join="outer", axis=0)
+        std_mat = standard_df.to_numpy(dtype=np.float64, copy=False)
+        pred_mat = test_df.to_numpy(dtype=np.float64, copy=False)
         denom = np.abs(std_mat + eps)
-        err_day = np.sum(np.abs(std_mat - pred_mat) / denom, axis=0)
+        # 老师版本：按时间点取平均，再对天取平均（而不是 sum）。
+        err_day = np.mean(np.abs(std_mat - pred_mat) / denom, axis=0)
         err_days.append(err_day)
 
     if not err_days:

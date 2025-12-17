@@ -32,7 +32,7 @@ public final class ValueOnlyTextOutputFormat extends FileOutputFormat<NullWritab
                     return;
                 }
                 // 只写出 value 一行（由 reducer 拼好的 CSV 行）。
-                dataOut.writeBytes(value.toString());
+                dataOut.write(value.getBytes(), 0, value.getLength());
                 dataOut.writeByte('\n');
             }
 
