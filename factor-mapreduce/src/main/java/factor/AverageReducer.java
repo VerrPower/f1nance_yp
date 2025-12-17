@@ -1,5 +1,6 @@
 package factor;
 
+import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Reducer;
@@ -15,12 +16,14 @@ import java.util.StringJoiner;
  * <p>Output is CSV, with one file per tradingDay. The first row is the header:
  * tradeTime,alpha_1,...,alpha_20</p>
  */
-public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWritable, Text> {
+public class AverageReducer extends Reducer<IntWritable, FactorWritable, NullWritable, Text> {
 
     private final Text outValue = new Text();
     private MultipleOutputs<NullWritable, Text> multipleOutputs;
-    private long currentDay = Long.MIN_VALUE;
+    private int currentDayCode = Integer.MIN_VALUE;
     private static final int EXPECTED_STOCKS = 300;
+    private static final int BASE_SEC_6AM = 21_600;
+    private static final int MASK_TIME15 = (1 << 15) - 1;
 
     @Override
     protected void setup(Context context) {
@@ -28,17 +31,19 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
     }
 
     @Override
-    protected void reduce(DayTimeKey key, Iterable<FactorWritable> values, Context context) throws IOException, InterruptedException {
+    protected void reduce(IntWritable key, Iterable<FactorWritable> values, Context context) throws IOException, InterruptedException {
         FactorWritable sum = new FactorWritable();
         
         for (FactorWritable val : values) {
             sum.add(val);
         }
 
-        if (key.getTradingDay() != currentDay) {
-            currentDay = key.getTradingDay();
+        int compact = key.get();
+        int dayCode = compact >>> 15;
+        if (dayCode != currentDayCode) {
+            currentDayCode = dayCode;
             // 每个交易日的输出文件首行写表头（MultipleOutputs 按 tradingDay 分目录）。
-            multipleOutputs.write(NullWritable.get(), new Text(csvHeaderLine()), dayOutputBasePath(currentDay));
+            multipleOutputs.write(NullWritable.get(), new Text(csvHeaderLine()), dayOutputBasePath(dayCode));
         }
 
         double[] averages = new double[20];
@@ -46,8 +51,8 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
         int count = EXPECTED_STOCKS;
 
         StringJoiner joiner = new StringJoiner(",");
-        // tradeTime 在原始 CSV 中通常是 6 位（例如 092500），这里补齐前导零，避免与标准输出对齐失败。
-        joiner.add(formatTradeTime(key.getTradeTime()));
+        int secOfDay = (compact & MASK_TIME15) + BASE_SEC_6AM;
+        joiner.add(formatTradeTimeFromSecOfDay(secOfDay));
         for (int i = 0; i < 20; i++) {
             averages[i] = totals[i] / count;
             // 标准答案通常使用 Double 的完整字符串表示（不强制固定小数位）；
@@ -56,7 +61,7 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
         }
 
         outValue.set(joiner.toString());
-        multipleOutputs.write(NullWritable.get(), outValue, dayOutputBasePath(currentDay));
+        multipleOutputs.write(NullWritable.get(), outValue, dayOutputBasePath(dayCode));
     }
 
     @Override
@@ -66,10 +71,10 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
         }
     }
 
-    private static String dayOutputBasePath(long tradingDay) {
-        // 标准答案按日期输出为 0102.csv、0103.csv ...（取 tradingDay 的 MMDD）。
+    private static String dayOutputBasePath(int dayCode) {
+        // 标准答案按日期输出为 0102.csv、0103.csv ...（取 MMDD）。
         // MultipleOutputs 实际会追加 reducer 后缀（例如 0102.csv-r-00000）。
-        return formatDayFilePrefix(tradingDay);
+        return formatDayFilePrefixFromDayCode(dayCode);
     }
 
     private static String csvHeaderLine() {
@@ -81,16 +86,16 @@ public class AverageReducer extends Reducer<DayTimeKey, FactorWritable, NullWrit
         return joiner.toString();
     }
 
-    private static String formatTradeTime(long tradeTime) {
-        // 标准答案的 tradeTime 使用 6 位 HHmmss（例如 092500），这里统一补齐前导零。
-        if (tradeTime >= 0 && tradeTime < 1_000_000L) {
-            return String.format(Locale.ROOT, "%06d", tradeTime);
-        }
-        return Long.toString(tradeTime);
+    private static String formatTradeTimeFromSecOfDay(int secOfDay) {
+        int hh = secOfDay / 3600;
+        int mm = (secOfDay - hh * 3600) / 60;
+        int ss = secOfDay - hh * 3600 - mm * 60;
+        return String.format(Locale.ROOT, "%02d%02d%02d", hh, mm, ss);
     }
 
-    private static String formatDayFilePrefix(long tradingDay) {
-        long mmdd = Math.floorMod(tradingDay, 10_000L);
-        return String.format(Locale.ROOT, "%04d.csv", mmdd);
+    private static String formatDayFilePrefixFromDayCode(int dayCode) {
+        int month = (dayCode >>> 5) & 0x0F;
+        int day = dayCode & 0x1F;
+        return String.format(Locale.ROOT, "%02d%02d.csv", month, day);
     }
 }

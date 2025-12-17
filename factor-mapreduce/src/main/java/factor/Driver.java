@@ -1,10 +1,9 @@
 package factor;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Locale;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Job;
@@ -22,7 +21,7 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
  *   <li><b>InputFormat：</b>{@link FixedCombineTextInputFormat} 组合多个 CSV 为一个 split（单文件不切分），
  *   以减少 mapper 数量。</li>
  *   <li><b>Mapper：</b>{@link StockFactorMapper} 逐行解析 CSV（直接在 {@code byte[]} 上做 ASCII 扫描），计算 20 个因子，
- *   输出键为 {@link DayTimeKey}(tradingDay, tradeTime)，值为 {@link FactorWritable}(20 维因子向量“求和态”。)</li>
+ *   输出键为 30-bit {@link IntWritable}（day+time 压缩后的 CompactTime），值为 {@link FactorWritable}(20 维因子向量“求和态”。)</li>
  *   <li><b>Combiner：</b>{@link FactorCombiner} 对同一个 (day,time) 的 value 做本地预聚合
  *   （逐维求和），减少 shuffle 传输量。</li>
  *   <li><b>Partitioner：</b>{@link DayPartitioner} 仅按 tradingDay 分区，避免不同日期混到同一个 reduce 分区。</li>
@@ -64,7 +63,7 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
  *   +-----------------------------------------------+
  *   | Shuffle/Sort                                   |
  *   | - 按 DayPartitioner：以 tradingDay 分区        |
- *   | - 分区内按 DayTimeKey 排序：(day,time) 升序     |
+ *   | - 分区内按 CompactTime 排序：(day,time) 升序     |
  *   +-----------------------------------------------+
  *                 |
  *                 v
@@ -112,7 +111,7 @@ public class Driver {
         job.setMapperClass(StockFactorMapper.class);
         job.setCombinerClass(FactorCombiner.class);
         job.setReducerClass(AverageReducer.class);
-        job.setMapOutputKeyClass(DayTimeKey.class);
+        job.setMapOutputKeyClass(IntWritable.class);
         job.setMapOutputValueClass(FactorWritable.class);
         
         // 关键点：使用数值型复合 key，按 (tradingDay, tradeTime) 聚合与排序，并按天分区输出。

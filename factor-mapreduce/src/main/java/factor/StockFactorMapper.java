@@ -1,6 +1,7 @@
 package factor;
 
 import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Mapper;
 
@@ -17,14 +18,16 @@ import java.io.IOException;
  *   <li>仅维护上一条快照的最小状态（ap1/bp1/前5档深度）用于 t-1 因子（alpha_17/18/19）；遇到换日则重置。</li>
  * </ul>
  */
-public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, FactorWritable> {
+public class StockFactorMapper extends Mapper<LongWritable, Text, IntWritable, FactorWritable> {
 
-    private final DayTimeKey outKey = new DayTimeKey();
+    private final IntWritable outKey = new IntWritable();
     private final FactorWritable outValue = new FactorWritable();
 
     private static final double EPSILON = 1.0e-7;
     private static final byte COMMA = (byte) ',';
     private static final byte CR = (byte) '\r';
+    private static final int BASE_SEC_6AM = 21_600;
+    private static final int MASK_TIME15 = (1 << 15) - 1;
 
     // t-1 相关状态（只保存计算 alpha_17/18/19 所需的最小信息）。
     private boolean hasPrev = false;
@@ -282,7 +285,7 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
         // -------------------- 3) 输出与更新 t-1 状态 --------------------
         // 注意：即使不输出该条记录，也要维护 t-1 状态，
         // 因为 09:30:00 的 t-1 可能来自 09:29:57（在输出窗口之外）。
-        outKey.set(tradingDay, secOfDay);
+        outKey.set(packCompactTime30(tradingDay, secOfDay));
         context.write(outKey, outValue);
 
         // 更新 t-1（仅保留必要统计量）
@@ -298,6 +301,26 @@ public class StockFactorMapper extends Mapper<LongWritable, Text, DayTimeKey, Fa
     private static boolean shouldEmit(int secOfDay) {
         // 标准答案输出时间窗口：9:30:00~11:30:00 + 13:00:00~15:00:00（含端点）。
         return (secOfDay >= 34_200 && secOfDay <= 41_400) || (secOfDay >= 46_800 && secOfDay <= 54_000);
+    }
+
+    /**
+     * 30-bit CompactTime：
+     * <pre>
+     * dayCode(15) = (yearOffset(6) << 9) | (month(4) << 5) | day(5)
+     * timeCode(15)= secOfDay - 06:00:00
+     * compact30   = (dayCode << 15) | timeCode
+     * </pre>
+     */
+    private static int packCompactTime30(int tradingDay, int secOfDay) {
+        int year = tradingDay / 10_000;
+        int month = (tradingDay / 100) % 100;
+        int day = tradingDay % 100;
+        int yearOffset = year - 1990;
+        int dayCode = (yearOffset << 9) | (month << 5) | day;
+        int timeCode = secOfDay - BASE_SEC_6AM;
+        // 约束：timeCode 必须落在 0..32767（15bit），否则压缩会溢出并导致聚合/排序错误。
+        // 当前数据只覆盖交易时段（>=09:15），因此这里直接 mask 足够；若未来出现更早时间需改编码策略。
+        return (dayCode << 15) | (timeCode & MASK_TIME15);
     }
 
     private static int parseFixed8Digits(byte[] s, int pos) {

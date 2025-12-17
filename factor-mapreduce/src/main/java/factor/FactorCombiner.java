@@ -1,5 +1,6 @@
 package factor;
 
+import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.mapreduce.Reducer;
 
 import java.io.IOException;
@@ -8,10 +9,10 @@ import java.io.IOException;
  * Combiner that pre-aggregates factor sums and counts per (day,time) key to
  * reduce shuffle size.
  */
-public class FactorCombiner extends Reducer<DayTimeKey, FactorWritable, DayTimeKey, FactorWritable> {
+public class FactorCombiner extends Reducer<IntWritable, FactorWritable, IntWritable, FactorWritable> {
 
     @Override
-    protected void reduce(DayTimeKey key, Iterable<FactorWritable> values, Context context) throws IOException, InterruptedException {
+    protected void reduce(IntWritable key, Iterable<FactorWritable> values, Context context) throws IOException, InterruptedException {
         FactorWritable sum = new FactorWritable();
         for (FactorWritable val : values) {
             sum.add(val);

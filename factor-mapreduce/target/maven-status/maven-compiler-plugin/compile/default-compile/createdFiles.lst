@@ -3,7 +3,6 @@ factor/DayPartitioner.class
 factor/ValueOnlyTextOutputFormat$1.class
 factor/FactorWritable.class
 factor/FixedCombineTextInputFormat.class
-factor/DayTimeKey.class
 factor/Driver.class
 factor/StockFactorMapper.class
 factor/ValueOnlyTextOutputFormat.class
