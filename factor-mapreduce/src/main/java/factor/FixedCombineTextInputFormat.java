@@ -22,14 +22,19 @@ import org.apache.hadoop.mapreduce.lib.input.LineRecordReader;
 /**
  * Combine InputFormat：将多个 CSV 合并为一个 split（按文件数控制），每个文件保持不切分。
  *
- * maxFiles 在类内硬编码为 {@link #MAX_FILES}：每个 mapper 处理的 csv 文件数上限。
+ * 关键目标：
+ * <ul>
+ *   <li><b>split 不跨交易日</b>：day 之间任务完全独立。</li>
+ *   <li><b>day 内均匀切分</b>：若该 day 有 N 个股票 csv，则按 P 份均匀切分，P 写死为
+ *       {@code min(8, Runtime.getRuntime().availableProcessors())}。</li>
+ * </ul>
  */
 public final class FixedCombineTextInputFormat extends CombineFileInputFormat<ShortWritable, Text> {
-    public static final int MAX_FILES = 300;
+    public static final int MAX_THREADS = 8;
     private static final boolean PRINT_SPLIT_PLAN = false;
 
     static {
-        System.out.printf("@ FixedCombineTextInputFormat: maxFiles=%d%n", MAX_FILES);
+        System.out.printf("@ FixedCombineTextInputFormat: maxThreads=%d%n", MAX_THREADS);
     }
 
     @Override
@@ -49,7 +54,7 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
         List<FileStatus> files = listStatus(job);
         List<InputSplit> splits = new ArrayList<>();
 
-        // 关键保证：split 不跨交易日（map-only 需要“一天=一个 mapper”以在 mapper 内完成 300股截面平均）。
+        // 关键保证：split 不跨交易日（day 之间任务完全独立；且 mapper 的 dayId 取自首行）。
         // 路径结构期望：.../<day>/<stock>/snapshot.csv
         Map<String, DayGroup> byDay = new LinkedHashMap<>();
         for (FileStatus stat : files) {
@@ -69,8 +74,13 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
         for (Map.Entry<String, DayGroup> e : byDay.entrySet()) {
             DayGroup g = e.getValue();
             int n = g.paths.size();
-            for (int i = 0; i < n; i += MAX_FILES) {
-                int j = Math.min(i + MAX_FILES, n);
+            int procs = Runtime.getRuntime().availableProcessors();
+            int p = Math.min(MAX_THREADS, Math.max(1, procs));
+            int splitsForDay = Math.min(p, n);
+            int chunkSize = (n + splitsForDay - 1) / splitsForDay;
+
+            for (int i = 0; i < n; i += chunkSize) {
+                int j = Math.min(i + chunkSize, n);
                 List<Path> groupPaths = new ArrayList<>(g.paths.subList(i, j));
                 List<Long> groupLengths = new ArrayList<>(g.lengths.subList(i, j));
                 if (PRINT_SPLIT_PLAN) {

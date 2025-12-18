@@ -5,3 +5,4 @@ err_distr_out/
 local_buffer/
 factor-mapreduce/target/
 pipeline/
+myhashtable/

@@ -1,13 +1,10 @@
 package factor;
 
-import org.apache.hadoop.io.NullWritable;
+import java.io.IOException;
+import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.ShortWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Mapper;
-import org.apache.hadoop.mapreduce.lib.output.MultipleOutputs;
-
-import java.io.IOException;
-import java.util.Locale;
 
 /**
  * <b>StockFactorMapper</b>：逐行读取快照 CSV，计算 {@code alpha_1..alpha_20}，并在 Mapper 内对同一时间点做预聚合。
@@ -23,15 +20,16 @@ import java.util.Locale;
  *          解析前 5 档盘口与必要字段，计算 20 个因子；其中 {@code alpha_17/18/19} 依赖 t-1 状态。
  *          当检测到 fileId 变化或时间倒退时清空。</li>
  *   <li><b>输出</b> : 
- *          map-only：mapper 在 {@code cleanup()} 输出当天 CSV（表头 + 4802 行），每行是该时刻 300 股截面平均。</li>
+ *          mapper 输出 {@code <IntWritable, FactorWritable>}：
+ *          key 为打包的 {@code (dayId,time)}，value 为 {@code sum[20]+count}（供 reducer 求均值）。</li>
  *   <li><b>Mapper 内聚合</b> : 
  *          在mapper中提前执行不同股票间因子值累加，对输入“张量”的“股票”维度进行压缩。
- *          把 20 维因子向量按照时间戳为key，累加到本地的 {@code AGG20_FP64}哈希表；
- *          并在最后的 {@code cleanup()} 中批量输出当天 CSV。
+ *          把 20 维因子向量按照时间戳为key，累加到本地的 {@code AGG21_FP64} 哈希表（额外维护 count）；
+ *          并在最后的 {@code cleanup()} 中批量输出聚合后的 KV。
  *   </li>
  * </ul>
  */
-public class StockFactorMapper extends Mapper<ShortWritable, Text, NullWritable, Text> {
+public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, FactorWritable> {
 
     // 常数列表
     private static final double EPSILON = 1.0e-7;
@@ -39,18 +37,16 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, NullWritable,
     private static final byte CR = (byte) '\r';
     private static final int BASE_SEC_6AM = 21600;
     private static final int MASK_TIME15 = (1 << 15) - 1;
-    private static final int EXPECTED_STOCKS = 300;
-    private static final double INV_EXPECTED_STOCKS = 1.0d / (double) EXPECTED_STOCKS;
-    private static final Text HEADER = new Text(csvHeaderLine());
+    private static final int FACTOR_COUNT = 20;
+    private static final int VALUE_SIZE = FACTOR_COUNT + 1; // last element is count
 
     // 可复用对象
-    private final Text outValue = new Text();
-    private final double[] tmpFactors = new double[20];
-    private final AGG20_FP64 localAggHashTable = new AGG20_FP64();
-    private final StringBuilder sb = new StringBuilder(512);
-    private MultipleOutputs<NullWritable, Text> multipleOutputs;
+    private final IntWritable outKey = new IntWritable();
+    private final FactorWritable outValue = new FactorWritable();
+    private final double[] tmpFactors = new double[FACTOR_COUNT];
+    private final AGG21_FP64 localAggHashTable = new AGG21_FP64();
     private boolean dayInited = false;
-    private int tradingDay = 0;
+    private int dayId = 0; // MMDD as int (e.g., 0102 -> 102)
 
     
     // t-1 相关状态（只保存计算 alpha_17/18/19 所需的最少信息）。
@@ -95,7 +91,7 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, NullWritable,
         // field 0/1：data_fix 行首为 YYYYMMDD,HHMMSS,
         final int tradingDayParsed = parseFixed8Digits(s, 0);
         if (!dayInited) {
-            tradingDay = tradingDayParsed;
+            dayId = tradingDayParsed % 10_000;
             dayInited = true;
         }
         final int secOfDay = parseFixed6DigitsToSecOfDay(s, 9);
@@ -296,7 +292,7 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, NullWritable,
         // -------------------- 3) Mapper 内聚合与更新 t-1 状态 --------------------
         // 注意：即使不输出该条记录，也要维护 t-1 状态，
         // 因为 09:30:00 的 t-1 可能来自 09:29:57（在输出窗口之外）。
-        localAggHashTable.add_by_python3p9(packCompactTime30bits(tradingDayParsed, secOfDay), factors);
+        localAggHashTable.add_by_python3p9(packDayTimeKey(dayId, secOfDay), factors);
 
         // 更新 t-1（仅保留必要统计量）
         hasPrev = true;
@@ -309,53 +305,18 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, NullWritable,
 
 
     @Override
-    protected void setup(Context context) {
-        this.multipleOutputs = new MultipleOutputs<>(context);
-    }
-
-    @Override
-    protected void cleanup(Context p_context) throws IOException, InterruptedException {
-        if (multipleOutputs == null) return;
-        if (!dayInited) {
-            multipleOutputs.close();
-            return;
-        }
-
-        // 输出文件名：MMDD.csv（MultipleOutputs 会追加 -m-00000）
-        final String basePath = String.format(Locale.ROOT, "%04d.csv", tradingDay % 10000);
-        multipleOutputs.write(NullWritable.get(), HEADER, basePath);
-
-        for (int timeIndex = 0; timeIndex < 4802; timeIndex++) {
-            final int secOfDay;
-            if (timeIndex < 2401) {
-                secOfDay = 34_200 + 3 * timeIndex;
-            } else {
-                secOfDay = 46_800 + 3 * (timeIndex - 2401);
-            }
-
-            final int compactKey = packCompactTime30bits(tradingDay, secOfDay);
-            final int slot = localAggHashTable.findSlot_by_python3p9(compactKey);
-
-            sb.setLength(0);
-            appendTradeTimeFromSecOfDay(sb, secOfDay);
-            if (slot >= 0) {
-                final int base = slot * AGG20_FP64.NUM_FACTORS;
-                for (int i = 0; i < 20; i++) {
-                    sb.append(',');
-                    sb.append(Double.toString(localAggHashTable.vals[base + i] * INV_EXPECTED_STOCKS));
-                }
-            } else {
-                for (int i = 0; i < 20; i++) sb.append(",0");
-            }
-            outValue.set(sb.toString());
-            multipleOutputs.write(NullWritable.get(), outValue, basePath);
-        }
-
-        multipleOutputs.close();
+    protected void cleanup(Context context) throws IOException, InterruptedException {
+        // mapper 输出：对 (dayId, tradeTime) 的本地聚合 sum[20] + count。
+        localAggHashTable.emitTo(context, outKey, outValue);
     }
 
 
     // murmur...
+
+    private static int packDayTimeKey(int dayId, int secOfDay) {
+        int timeCode = secOfDay - BASE_SEC_6AM;
+        return (dayId << 15) | (timeCode & MASK_TIME15);
+    }
 
     /**
      * <b>30位紧凑时间编码（CompactTime30bits）</b>：
@@ -532,15 +493,15 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, NullWritable,
      *      我们最终选择 {@code CPython 3.9} 的版本更多的是出于对其算法本身的欣赏
      * </p>
      */
-    private static final class AGG20_FP64 {
-        private static final int NUM_FACTORS = 20;
+    private static final class AGG21_FP64 {
+        private static final int NUM_FACTORS = VALUE_SIZE;
         private static final int CAPACITY = 8192;
         private static final int MASK = CAPACITY - 1;
 
         final int[] keys;      // storedKey = compactKey + 1; 0 means empty
-        final double[] vals;   // flat: slot * 20 + i
+        final double[] vals;   // flat: slot * 21 + i
 
-        AGG20_FP64() {
+        AGG21_FP64() {
             keys = new int[CAPACITY];
             vals = new double[CAPACITY * NUM_FACTORS];
         }
@@ -571,8 +532,8 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, NullWritable,
          *      并将其加至递推结果中。这使得探测序列不仅依赖于当前索引 i，还受到哈希值所有比特的渐进影响，进一步减少了不同哈希值映射到相同探测路径的可能性。
          * </p>
          */
-        void add_by_python3p9(int compactKey, double[] factors20) {
-            int stored = compactKey + 1;
+        void add_by_python3p9(int packedKey, double[] factors20) {
+            int stored = packedKey + 1;
             int hash = stored;
             int ptr = hash & MASK;
             int perturb = hash;
@@ -583,35 +544,39 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, NullWritable,
                 if (k == 0) {
                     keys[ptr] = stored;
                     int base = ptr * NUM_FACTORS;
-                    for (int i = 0; i < NUM_FACTORS; i++) vals[base + i] = factors20[i];
+                    for (int i = 0; i < FACTOR_COUNT; i++) vals[base + i] = factors20[i];
+                    vals[base + FACTOR_COUNT] = 1.0d;
                     return;
                 }
                 if (k == stored) {
                     int base = ptr * NUM_FACTORS;
-                    for (int i = 0; i < NUM_FACTORS; i++) vals[base + i] += factors20[i];
+                    for (int i = 0; i < FACTOR_COUNT; i++) vals[base + i] += factors20[i];
+                    vals[base + FACTOR_COUNT] += 1.0d;
                     return;
                 }
 
                 probes++;
                 if (probes > MASK) 
-                    throw new IllegalStateException("AGG20_FP64 overflow: CAPACITY too small for observed keys");
+                    throw new IllegalStateException("AGG21_FP64 overflow: CAPACITY too small for observed keys");
                 // CPython: perturb >>= PERTURB_SHIFT (5)
                 perturb >>>= 5;
                 ptr = (5 * ptr + 1 + perturb) & MASK;
             }
         }
 
-        int findSlot_by_python3p9(int compactKey) {
-            int stored = compactKey + 1;
-            int hash = stored;
-            int ptr = hash & MASK;
-            int perturb = hash;
-            while (true) {
-                int k = keys[ptr];
-                if (k == stored) return ptr;
-                if (k == 0) return -1;
-                perturb >>>= 5;
-                ptr = (5 * ptr + 1 + perturb) & MASK;
+        void emitTo(Context context, IntWritable outKey, FactorWritable outValue)
+                throws IOException, InterruptedException {
+            final int[] keys = this.keys;
+            final double[] vals = this.vals;
+            final double[] out = outValue.factors;
+            for (int ptr = 0; ptr < CAPACITY; ptr++) {
+                int stored = keys[ptr];
+                if (stored == 0) continue;
+                int packedKey = stored - 1;
+                outKey.set(packedKey);
+                int base = ptr * NUM_FACTORS;
+                for (int i = 0; i < NUM_FACTORS; i++) out[i] = vals[base + i];
+                context.write(outKey, outValue);
             }
         }
 
