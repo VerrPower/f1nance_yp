@@ -7,7 +7,7 @@
 默认参数（路径全部写死）：
 - JAR: factor-mapreduce/target/factor-mapreduce-0.1.0-SNAPSHOT.jar
 - MAIN_CLASS: factor.Driver
-- HDFS_INPUT: 固定读取全部 day：/user/pogi/HD_INPUT_REPO/FINANCE_for_YP/*/*/snapshot.csv
+- HDFS_INPUT: 数据根目录（day 根目录）：/user/pogi/HD_INPUT_REPO/FINANCE_for_YP
 - HDFS_OUTPUT: /user/pogi/HD_OUTPUT_REPO/FINANCE_for_YP/run_<timestamp>
 - LOCAL_OUT_DIR: local_buffer/hdfs_out
 """
@@ -72,8 +72,8 @@ class JobConfig:
 
 
 def build_hdfs_input() -> str:
-    # 固定跑全部 day：/ROOT/*/*/snapshot.csv
-    return f"{DEFAULT_HDFS_INPUT_ROOT}/*/*/snapshot.csv"
+    # 只传入根目录：Driver 内部会固定按 <root>/*/*/snapshot.csv 读取。
+    return f"{DEFAULT_HDFS_INPUT_ROOT}"
 
 
 def load_config() -> JobConfig:
@@ -126,7 +126,7 @@ def hdfs_get(src_dir: str, local_parent_dir: Path, *, cfg: JobConfig) -> Path:
 
 def preflight(cfg: JobConfig) -> None:
     print("Preflight: 检查 HDFS 输入文件...")
-    files = hdfs_ls(cfg.hdfs_input, cfg=cfg)
+    files = hdfs_ls(f"{cfg.hdfs_input}/*/*/snapshot.csv", cfg=cfg)
     copying = [p for p in files if "_COPYING_" in p]
     if copying:
         print("检测到 _COPYING_（未完成上传）文件，建议先清理/重传后再跑：")

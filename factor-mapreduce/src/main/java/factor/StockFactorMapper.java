@@ -88,13 +88,18 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         if (c0 < '0' || c0 > '9') return;
 
         // @===================================== 基于原始字节数组的单指针字段解析 ====================================@
-        // field 0/1：data_fix 行首为 YYYYMMDD,HHMMSS,
-        final int tradingDayParsed = parseFixed8Digits(s, 0);
+        // field 0/1：行首固定为 YYYYMMDD,HHMMSS,
+        // 只需要 MMDD：直接跳过 year 的 4 位。
         if (!dayInited) {
-            dayId = tradingDayParsed % 10_000;
+            int month = (s[4] - '0') * 10 + (s[5] - '0');
+            int day = (s[6] - '0') * 10 + (s[7] - '0');
+            dayId = month * 100 + day; // MMDD（int）
             dayInited = true;
         }
-        final int secOfDay = parseFixed6DigitsToSecOfDay(s, 9);
+        int hh = (s[9] - '0') * 10 + (s[10] - '0');
+        int mm = (s[11] - '0') * 10 + (s[12] - '0');
+        int ss = (s[13] - '0') * 10 + (s[14] - '0');
+        final int secOfDay = hh * 3600 + mm * 60 + ss;
         int pos = 16; // 8 + ',' + 6 + ','
 
         // Combine 可能让一个 mapper 处理多个文件，时间戳会“跳回早期”；遇到 tradeTime 逆序时清空 t-1。
@@ -292,7 +297,15 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         // -------------------- 3) Mapper 内聚合与更新 t-1 状态 --------------------
         // 注意：即使不输出该条记录，也要维护 t-1 状态，
         // 因为 09:30:00 的 t-1 可能来自 09:29:57（在输出窗口之外）。
-        localAggHashTable.add_by_python3p9(packDayTimeKey(dayId, secOfDay), factors);
+        // Key 编码（int32）：
+        // ┌────────────── FROM HIGH --to--> LOW ──────────────┐
+        // │ dayId = MMDD（十进制） │ timeCode(15 bits)         │
+        // └───────────────────────────────────────────────────┘
+        // - dayId：十进制拼接的 MMDD（即 month*100+day），直接从 tradingDay 跳过 year 解析得到
+        // - timeCode：secOfDay - 06:00:00，限定在 0..32767
+        int timeCode = secOfDay - BASE_SEC_6AM;
+        int packedKey = (dayId << 15) | (timeCode & MASK_TIME15);
+        localAggHashTable.add_by_python3p9(packedKey, factors);
 
         // 更新 t-1（仅保留必要统计量）
         hasPrev = true;
@@ -312,77 +325,7 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
 
 
     // murmur...
-
-    private static int packDayTimeKey(int dayId, int secOfDay) {
-        int timeCode = secOfDay - BASE_SEC_6AM;
-        return (dayId << 15) | (timeCode & MASK_TIME15);
-    }
-
-    /**
-     * <b>30位紧凑时间编码（CompactTime30bits）</b>：
-     * <p>
-     * 将日期（交易日期 int yyyyMMdd）与当日秒数（0-86399）压缩至30bits，仅仅用一个Java的32位int就能装得下！
-     * </p>
-     * <b>编码结构（从高位到低位）</b> ：
-     * <pre>
-     * 高位（bit 29...15）：dayCode = (year - 1990)(6b) | month(4b) | day(5b)
-     *低位 (bit 14...0)：timeCode = sec-in-day - 6×3600
-     * 
-     * ┌────────────────── FROM HIGH --to--> LOW───────────────────┐
-     * │ reserved(2 bits) │ dayCode(15 bits)  │  timeCode(15 bits) │
-     * └───────────────────────────────────────────────────────────┘
-     * 
-     * <b>字段细节</b> ：
-     * • 年偏移    = year - 1990     （6位，支持范围1990-2053够用）
-     * • 月份      = month           （4位，1-12）
-     * • 日期      = day             （5位，1-31刚刚好！）
-     * • 日内秒偏移 = secOfDay - 06:00:00 （15位，支持范围06:00-23:59）
-     * </pre>
-     * 
-     * <b>设计理由：</b>
-     * <p>
-     * 1. <b>年份原点设为1990年</b> ：
-     *      深圳证券交易所（1990年12月1日成立）和上海证券交易所（1990年11月26日成立）均在该年后开始交易，
-     *      因此实际交易数据年份不会早于1990年，此设定可有效压缩年份表示范围。
-     * </p><p>
-     * 2. <b>交易日内时间原点设为06:00</b> ：
-     *      沪深交易所开盘时间均在上午9点以后，将时间基线前移至06:00可使所有交易时段的时间码均为正值，
-     *      且能充分利用15位无符号整数范围（0-32767秒，约9.1小时），覆盖完整交易时段（9:30-15:00）并留有余量。
-     * </p><p>
-     * 3. <b>30位总宽度</b> ：
-     *      在保证可表示实际交易数据范围的前提下，实现最大程度的空间压缩，可直接用单个int存储，便于哈希和比较操作。
-     * </p>
-     * <p>
-     * <b>[锐评一下]</b> 
-     * <p>
-     *      实际上一开始我只对年份设置了截断，设计的是32位编码。
-     *      奈何Java不像c/c++有{@code uint32_t}，所以必须对int使用特殊的比较函数。
-     *      这妨碍了key的去封装（一开始key是一个{@code <TradeDay, TradeTime>}对象）。所以后面又对日内秒数进行了截断。
-     * </p><p>
-     *      BTW，目前的key<b>甚至能继续压缩</b>。想象一下：如果year是确定的，那么直接少一个编码对象
-     *      （这里的对象就是人类自然语言里面那个对象，跟编程语言没关系）；如果交易时间定死，交易间隔（目前是3s）定死，
-     *      我可以设置上午下午两个日内秒起始点，减去偏移量之后除以间隔（3s）。当然这不是最极限的。
-     *      最极限的是用 Hartley信息量计算最小定长位宽：<b>⌈log2 N⌉</b>
-     *      当然这么做代价也很大。不同field之间的编码在同一个bit交织导致编码本身几乎没有实际含义，
-     *      同时如此激进的编码会导致数据适配范围相当窄，基本无法投入生产环境，只能针对特化数据进行针对性打击。
-     *      当然了，debug起来也是噩梦。
-     * </p><p>
-     *      当编码长度下降到一个临界值之后，几乎每缩短一位就会导致一定程度的语义损失。
-     *      有时候编码省下来的那点io开销差距微不足道，
-     *      特别是生产环境，语义上的清晰度反而比零点零几（甚至不到）的速度提升更为重要！
-     * </p>
-     */
-    private static int packCompactTime30bits(int tradingDay, int secOfDay) {
-        int year = tradingDay / 10_000;
-        int month = (tradingDay / 100) % 100;
-        int day = tradingDay % 100;
-        int yearOffset = year - 1990;
-        int dayCode = (yearOffset << 9) | (month << 5) | day;
-        int timeCode = secOfDay - BASE_SEC_6AM;
-        // 约束：timeCode 必须落在 0..32767（15bit），否则压缩会溢出并导致聚合/排序错误。
-        // 当前数据只覆盖交易时段（>=09:15），因此这里直接 mask 足够；若未来出现更早时间需改编码策略。
-        return (dayCode << 15) | (timeCode & MASK_TIME15);
-    }
+    // key 编码与 tradingDay/tradeTime 的解析均已内联到 map() 热路径（year 不再参与 key 编码）。
 
     private static String csvHeaderLine() {
         StringBuilder sb = new StringBuilder(256);
@@ -408,34 +351,6 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
     }
 
 
-    /**
-     * 解析8位固定长度数字字符串为int值。
-     * 采用无分支、依赖链拆解的设计：将8位解析拆分为4个独立的2位解析，再合并。
-     * 该设计虽对本场景的性能提升微不足道，杯水车薪，甚至说没什么🥚用，但体现了高性能计算中的重要原则：
-     * <b>依赖链拆解与超标量执行。</b>
-     * <p>
-     * 现代CPU具备多个执行单元和超标量流水线。过长的串行依赖链会限制指令级并行，
-     * 而拆解为多个独立计算链可使CPU同时执行多个操作，充分利用指令发射窗口。
-     * 这种思维在SIMD、向量化以及极限优化场景中尤为关键。
-     *
-     * @param p_s 字节数组，必须包含至少[pos, pos+7]范围的数字字符
-     * @param pos 起始位置
-     * @return 解析得到的整数值
-     */
-    private static int parseFixed8Digits(byte[] p_s, int pos) {
-        int v01 = (p_s[pos]     - '0') * 10 + (p_s[pos + 1] - '0');  // 第0-1位
-        int v23 = (p_s[pos + 2] - '0') * 10 + (p_s[pos + 3] - '0');  // 第2-3位
-        int v45 = (p_s[pos + 4] - '0') * 10 + (p_s[pos + 5] - '0');  // 第4-5位
-        int v67 = (p_s[pos + 6] - '0') * 10 + (p_s[pos + 7] - '0');  // 第6-7位
-        return (v01 * 1_000_000) + (v23 * 10_000) + (v45 * 100) + v67;
-    }
-
-    private static int parseFixed6DigitsToSecOfDay(byte[] p_s, int pos) {
-        int hh = (p_s[pos] - '0') * 10 + (p_s[pos + 1] - '0');
-        int mm = (p_s[pos + 2] - '0') * 10 + (p_s[pos + 3] - '0');
-        int ss = (p_s[pos + 4] - '0') * 10 + (p_s[pos + 5] - '0');
-        return hh * 3600 + mm * 60 + ss;
-    }
 
     
 

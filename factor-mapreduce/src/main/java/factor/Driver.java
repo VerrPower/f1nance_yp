@@ -96,14 +96,13 @@ public class Driver extends Configured implements Tool {
         conf.setInt("mapreduce.local.map.tasks.maximum", procs);
         conf.setInt("mapreduce.local.reduce.tasks.maximum", procs);
 
-        Path input = resolveInput(conf, new Path(args[0]));
+        // 输入约定（不做容错/探测）：args[0] 必定是数据根目录，结构固定为：
+        // <root>/<MMDD>/<stock>/snapshot.csv
+        Path inputRoot = new Path(args[0]);
+        Path inputFiles = new Path(inputRoot, "*/*/snapshot.csv");
 
-        // 自动发现 day（兼容单日/多日输入）。
-        Set<String> dayIds = discoverDayIds(conf, input);
-        if (dayIds.isEmpty()) {
-            System.err.println("No day directories discovered from input: " + args[0]);
-            return 2;
-        }
+        // 自动发现 day：仅扫描根目录的一级子目录名（MMDD）。
+        Set<String> dayIds = discoverDayIdsFromRoot(conf, inputRoot);
         StringBuilder dayCsv = new StringBuilder(dayIds.size() * 5);
         boolean first = true;
         for (String d : dayIds) {
@@ -133,7 +132,7 @@ public class Driver extends Configured implements Tool {
         // 关键点：输出只写 value（CSV 行），不写 key<TAB>value。
         job.setOutputFormatClass(ValueOnlyTextOutputFormat.class);
 
-        FileInputFormat.addInputPath(job, input);
+        FileInputFormat.addInputPath(job, inputFiles);
         FileOutputFormat.setOutputPath(job, new Path(args[1]));
 
         boolean ok;
@@ -141,110 +140,23 @@ public class Driver extends Configured implements Tool {
             ok = job.waitForCompletion(true);
         } finally {
             double sec = (System.nanoTime() - startNs) / 1_000_000_000.0;
-            System.out.printf(Locale.ROOT, "\n\n@ Driver: ElapsedSec: %.3f%n", sec);
+            System.out.printf(Locale.ROOT, "\n\n@ Driver: ElapsedSec: %.2f%n", sec);
         }
         return ok ? 0 : 1;
     }
 
-    private static Path resolveInput(Configuration conf, Path input) throws Exception {
-        FileSystem fs = input.getFileSystem(conf);
-
-        FileStatus[] direct = fs.globStatus(input);
-        if (direct == null || direct.length == 0) return input;
-
-        boolean anyFile = false;
-        boolean anyDir = false;
-        for (FileStatus st : direct) {
-            if (st == null) continue;
-            if (st.isFile()) {
-                anyFile = true;
-                break;
-            }
-            if (st.isDirectory()) anyDir = true;
-        }
-        if (anyFile || !anyDir) return input;
-
-        // 输入是目录/目录通配符：尝试补全到 snapshot.csv 文件级通配符（不依赖递归遍历）。
-        Path p1 = new Path(input, "*/*/snapshot.csv");
-        FileStatus[] s1 = fs.globStatus(p1);
-        if (s1 != null && s1.length > 0) return p1;
-
-        Path p2 = new Path(input, "*/snapshot.csv");
-        FileStatus[] s2 = fs.globStatus(p2);
-        if (s2 != null && s2.length > 0) return p2;
-
-        return input;
-    }
-
-    private static Set<String> discoverDayIds(Configuration conf, Path input) throws Exception {
-        FileSystem fs = input.getFileSystem(conf);
-
+    private static Set<String> discoverDayIdsFromRoot(Configuration conf, Path inputRoot) throws Exception {
+        FileSystem fs = inputRoot.getFileSystem(conf);
         Set<String> days = new TreeSet<>();
-
-        FileStatus[] direct = fs.globStatus(input);
-        if (direct != null) {
-            for (FileStatus st : direct) {
-                if (st == null) continue;
-                if (st.isFile()) {
-                    addDayFromSnapshotPath(days, st.getPath());
-                } else if (st.isDirectory()) {
-                    FileStatus[] files = fs.globStatus(new Path(st.getPath(), "*/*/snapshot.csv"));
-                    if (files == null || files.length == 0) {
-                        files = fs.globStatus(new Path(st.getPath(), "*/snapshot.csv"));
-                    }
-                    if (files != null) {
-                        for (FileStatus f : files) {
-                            if (f != null && f.isFile()) addDayFromSnapshotPath(days, f.getPath());
-                        }
-                    }
-                }
+        FileStatus[] entries = fs.listStatus(inputRoot);
+        if (entries != null) {
+            for (FileStatus st : entries) {
+                if (st == null || !st.isDirectory()) continue;
+                String day = st.getPath().getName();
+                if (day != null && day.length() == 4) days.add(day);
             }
         }
-
-        if (!days.isEmpty()) return days;
-
-        // fallback：如果 input 不是 glob 且 globStatus 返回空，尝试按根目录推断结构
-        try {
-            FileStatus st = fs.getFileStatus(input);
-            if (st.isDirectory()) {
-                FileStatus[] files = fs.globStatus(new Path(input, "*/*/snapshot.csv"));
-                if (files != null) {
-                    for (FileStatus f : files) {
-                        if (f != null && f.isFile()) addDayFromSnapshotPath(days, f.getPath());
-                    }
-                }
-            } else if (st.isFile()) {
-                addDayFromSnapshotPath(days, input);
-            }
-        } catch (Exception ignored) {
-            // keep empty
-        }
-
         return days;
-    }
-
-    private static void addDayFromSnapshotPath(Set<String> days, Path snapshotPath) {
-        // Expect: .../<day>/<stock>/snapshot.csv
-        Path p = snapshotPath;
-        if (p == null) return;
-        p = p.getParent(); // stock
-        if (p == null) return;
-        p = p.getParent(); // day
-        if (p == null) return;
-        String day = p.getName();
-        if (day == null) return;
-        if (day.length() == 4) {
-            // keep lexicographic order for deterministic mapping
-            days.add(day);
-        } else {
-            // fallback: still add, but zero-pad if it's numeric
-            try {
-                int id = Integer.parseInt(day);
-                days.add(String.format(Locale.ROOT, "%04d", id));
-            } catch (NumberFormatException ignored) {
-                days.add(day);
-            }
-        }
     }
 
     public static void main(String[] args) throws Exception {
