@@ -14,9 +14,9 @@
 - **log 模式精简**：`lifecycle/launch.py` 仅保留 `normal/mute`，去掉 redirect。
 
 ## 2) 涉及文件
-- `factor-mapreduce/src/main/java/factor/StockFactorMapper.java`（核心内联改造）
-- `factor-mapreduce/src/main/java/factor/Driver.java`（去浮点通道、固定 double）
-- `factor-mapreduce/src/main/java/factor/Snapshot.java` & `src/test/java/factor/SnapshotTest.java`（已删除）
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/StockFactorMapper.java`（核心内联改造）
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/Driver.java`（去浮点通道、固定 double）
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/Snapshot.java` & `src/test/java/pogi_one/SnapshotTest.java`（已删除）
 - `lifecycle/launch.py`（log 模式裁剪）
 
 ## 3) 精度与风险
@@ -24,8 +24,8 @@
 - 解析假设输入行首为 `YYYYMMDD,HHMMSS,`，且字段为纯数字整数；如输入格式变化需另行处理。
 
 ## 4) 验证方式
-- 编译测试：`mvn -f factor-mapreduce/pom.xml test`
-- 构建：`mvn -f factor-mapreduce/pom.xml -DskipTests clean package`
+- 编译测试：`mvn -f POGI-ONE-RELEASE/pom.xml test`
+- 构建：`mvn -f POGI-ONE-RELEASE/pom.xml -DskipTests clean package`
 - 运行 + 校验：`python lifecycle/launch.py --day 0102 --log mute` 运行；`python lifecycle/validate.py --mode form` 校验。
 
 ## 5) 性能预期

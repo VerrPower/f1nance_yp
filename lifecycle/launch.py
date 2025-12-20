@@ -5,8 +5,8 @@
 启动 Hadoop MapReduce 作业，并在完成后将 HDFS 输出拷贝回本地缓冲目录。
 
 默认参数（路径全部写死）：
-- JAR: factor-mapreduce/target/factor-mapreduce-0.1.0-SNAPSHOT.jar
-- MAIN_CLASS: factor.Driver
+- JAR: POGI-ONE-RELEASE/target/POGI-ONE-RELEASE-0.1.0-SNAPSHOT.jar
+- MAIN_CLASS: 固定为 pogi_one.Driver（脚本内写死）
 - HDFS_INPUT: 数据根目录（day 根目录）：/user/pogi/HD_INPUT_REPO/FINANCE_for_YP
 - HDFS_OUTPUT: /user/pogi/HD_OUTPUT_REPO/FINANCE_for_YP/run_<timestamp>
 - LOCAL_OUT_DIR: local_buffer/hdfs_out
@@ -32,8 +32,7 @@ def sep() -> str:
     return "=" * 72
 
 
-DEFAULT_JAR_PATH = "factor-mapreduce/target/factor-mapreduce-0.1.0-SNAPSHOT.jar"
-DEFAULT_MAIN_CLASS = "factor.Driver"
+DEFAULT_JAR_PATH = "POGI-ONE-RELEASE/target/POGI-ONE-RELEASE-0.1.0-SNAPSHOT.jar"
 DEFAULT_HDFS_INPUT_ROOT = "/user/pogi/HD_INPUT_REPO/FINANCE_for_YP"
 DEFAULT_HDFS_OUTPUT_ROOT = "/user/pogi/HD_OUTPUT_REPO/FINANCE_for_YP"
 DEFAULT_LOCAL_OUT_DIR = "local_buffer/hdfs_out"
@@ -65,7 +64,6 @@ def capture(
 @dataclass(frozen=True)
 class JobConfig:
     jar_path: Path
-    main_class: str
     hdfs_input: str
     hdfs_output: str
     local_out_dir: Path
@@ -79,13 +77,11 @@ def build_hdfs_input() -> str:
 def load_config() -> JobConfig:
     root = repo_root()
     jar_path = root / DEFAULT_JAR_PATH
-    main_class = DEFAULT_MAIN_CLASS
     hdfs_input = build_hdfs_input()
     hdfs_output = f"{DEFAULT_HDFS_OUTPUT_ROOT}/run_{time.strftime('%Y%m%d_%H%M%S')}"
     local_out_dir = root / DEFAULT_LOCAL_OUT_DIR
     return JobConfig(
         jar_path=jar_path,
-        main_class=main_class,
         hdfs_input=hdfs_input,
         hdfs_output=hdfs_output,
         local_out_dir=local_out_dir,
@@ -94,7 +90,6 @@ def load_config() -> JobConfig:
 
 def print_config(cfg: JobConfig) -> None:
     print(f"Jar       : {cfg.jar_path}")
-    print(f"Main      : {cfg.main_class}")
     print(f"HDFS input: {cfg.hdfs_input}")
     print(f"HDFS out  : {cfg.hdfs_output}")
     print(f"Local out : {cfg.local_out_dir}")
@@ -146,7 +141,7 @@ def run_job(cfg: JobConfig) -> None:
         print_config(cfg)
         print(sep())
         print("\n\n未找到 jar：", cfg.jar_path)
-        print("请先构建：mvn -f factor-mapreduce/pom.xml clean package")
+        print("请先构建：mvn -f POGI-ONE-RELEASE/pom.xml clean package")
         raise SystemExit(1)
 
     print(sep())
@@ -163,7 +158,7 @@ def run_job(cfg: JobConfig) -> None:
     print(sep())
     print("\n\n作业启动中...\n######## LEAVE PYTHON DOMAIN ########")
     # 使用 hadoop jar 直接运行（不依赖 bash alias）
-    jar_cmd = ["hadoop", "jar", str(cfg.jar_path), cfg.main_class, cfg.hdfs_input, cfg.hdfs_output]
+    jar_cmd = ["hadoop", "jar", str(cfg.jar_path), "pogi_one.Driver", cfg.hdfs_input, cfg.hdfs_output]
     subprocess.run(jar_cmd, check=True)
 
     print("######## REENTER PYTHON DOMAIN ########")

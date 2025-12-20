@@ -28,9 +28,9 @@ Combine 后一个 mapper 会顺序读多个文件，如果不处理，`alpha_17/
 - `StockFactorMapper` 在检测到 `fileId` 变化时清空 t-1 状态，并确保 **非输出窗口行** 也更新 `prevTradeTime/secOfDay`。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/FixedCombineTextInputFormat.java`
-- `factor-mapreduce/src/main/java/factor/StockFactorMapper.java`
-- `factor-mapreduce/src/main/java/factor/Driver.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/FixedCombineTextInputFormat.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/StockFactorMapper.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/Driver.java`
 
 ---
 
@@ -63,10 +63,10 @@ Combine 后一个 mapper 会顺序读多个文件，如果不处理，`alpha_17/
 - `AverageReducer` 输出仍维持原格式：tradeTime 写回 6 位 `HHMMSS`，day 仍输出为 `MMDD.csv` 前缀（通过 `DayTimeKey` 解码）。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/DayTimeKey.java`
-- `factor-mapreduce/src/main/java/factor/DayPartitioner.java`
-- `factor-mapreduce/src/main/java/factor/StockFactorMapper.java`
-- `factor-mapreduce/src/main/java/factor/AverageReducer.java`（行为保持一致，依赖 key 解码）
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/DayTimeKey.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/DayPartitioner.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/StockFactorMapper.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/AverageReducer.java`（行为保持一致，依赖 key 解码）
 
 ---
 
@@ -78,7 +78,7 @@ Combine 后一个 mapper 会顺序读多个文件，如果不处理，`alpha_17/
 ---
 
 ## 4) 验证方式
-- 构建：`mvn -f factor-mapreduce/pom.xml package -DskipTests`
+- 构建：`mvn -f POGI-ONE-RELEASE/pom.xml package -DskipTests`
 - 跑 MR：`python lifecycle/launch.py`
 - 校验：`python lifecycle/validate.py --eps 1e-7`
 

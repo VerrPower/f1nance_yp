@@ -4,7 +4,7 @@
 """
 以老师提供的 pandas/numpy 版本为核心逻辑：
 - 对每个因子 alpha_i，在每个交易日上计算：
-    err_day = sum_t |std(t) - pred(t)| / |std(t) + eps|
+    err_day = mean_t |std(t) - pred(t)| / |std(t) + eps|
   再对所有交易日取平均：
     err = average(err_day)
 - err < 0.01 判定通过

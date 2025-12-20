@@ -18,7 +18,7 @@
 - map-output records 从“快照行数级别”下降到“时间点级别”（每个 mapper 约 `4802` 条）。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/StockFactorMapper.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/StockFactorMapper.java`
 
 ---
 
@@ -30,7 +30,7 @@
 - 固定容量 `8192`（并带 overflow 防御性报错），在当前数据下冲突率极低。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/StockFactorMapper.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/StockFactorMapper.java`
 
 ---
 
@@ -46,7 +46,7 @@
 - 误差增大（从 e-11/e-9 级变为 e-8 级），但远低于老师阈值 `0.01`，仍稳定 PASS。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/FactorWritable.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/FactorWritable.java`
 
 ---
 
@@ -62,24 +62,25 @@
   - `fileId = key.get()` 用于检测换文件并清空 t-1 状态（alpha_17/18/19 正确性依赖）
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/FixedCombineTextInputFormat.java`
-- `factor-mapreduce/src/main/java/factor/StockFactorMapper.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/FixedCombineTextInputFormat.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/StockFactorMapper.java`
 
 ---
 
-## 5) OutputFormat：避免 Text->String 分配
+## 5) OutputFormat：直接写字节数组
 
-问题：`Text.toString()` 会构造 `String`，再由 `DataOutputStream.writeBytes` 编码写出，属于纯额外开销。
+问题：默认的 `Text` 输出会产生编码与对象分配开销。
 
-改动：直接写 `Text` 的底层字节数组与有效长度：
-- `ValueOnlyTextOutputFormat`：
-  - `dataOut.write(value.getBytes(), 0, value.getLength())`
-  - 仍然补 `'\n'` 保持一行一条记录
+改动：改用 `DayCsvOutputFormat` + `DayLineWritable` 直接写 `byte[]`：
+- RecordWriter 初始化时写表头
+- 每条记录直接写 `byte[]`，再补 `'\n'`
+- 每个 reducer 只写一个 `MMDD.csv`
 
-收益：减少 reducer 写出阶段的临时 `String` 分配与编码成本（边际收益，但无风险）。
+收益：减少 reducer 写出阶段的临时 `String/Text` 分配与编码成本。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/ValueOnlyTextOutputFormat.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/DayCsvOutputFormat.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/DayLineWritable.java`
 
 ---
 
@@ -93,7 +94,7 @@
   - 最终均值使用 `totals[i] * (1.0/300)`（倒数复用，减少除法指令）
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/AverageReducer.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/AverageReducer.java`
 
 ---
 

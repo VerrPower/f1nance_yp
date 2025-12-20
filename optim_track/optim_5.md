@@ -17,7 +17,7 @@
 - 运行时间更多由 HDFS 读入与 Mapper 计算决定。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/Driver.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/Driver.java`
 
 ---
 
@@ -35,7 +35,7 @@
 - 数据层面“按交易日切分”的假设从“经验”变成“代码保证”，Mapper 可删除跨日防御逻辑（更短路径、更小常数）。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/FixedCombineTextInputFormat.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/FixedCombineTextInputFormat.java`
 
 ---
 
@@ -54,7 +54,7 @@
 - 假设每个 dayDir 恰好 300 股票且 split 不跨 day；若数据结构变化（缺股票/多股票/跨日混入），需要回退到 reduce 或重新设计输出归并。
 
 涉及文件：
-- `factor-mapreduce/src/main/java/factor/StockFactorMapper.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/StockFactorMapper.java`
 
 ---
 
@@ -79,6 +79,5 @@ Map-Only 下输出文件由 Mapper 直接写，文件名形如：
 - 输入是否命中 OS page cache / HDFS block cache、以及 CPU 调度争用，会导致某次出现“冷读短板 map”，整体落入慢峰。
 
 建议：
-- 以 `hadoop jar ... factor.Driver ...` 的 `@ Driver: ElapsedSec` 作为核心指标（不包含 Python 端 preflight/copy）；
+- 以 `hadoop jar ... pogi_one.Driver ...` 的 `@ Driver: ElapsedSec` 作为核心指标（不包含 Python 端 preflight/copy）；
 - 至少跑 5 次取 median（比均值更抗抖动）。
-

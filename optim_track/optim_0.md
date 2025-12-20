@@ -19,8 +19,8 @@ HDFS 输入（1500 个 snapshot.csv 小文件）
   -> StockFactorMapper（逐行解析 CSV，计算 20 因子；输出 key=(day,time)，value=(sum[20],count=1)）
   -> FactorCombiner（对同 key 做 sum+count，本地预聚合）
   -> Shuffle/Sort（按 DayPartitioner 分区、DayTimeKey 排序）
-  -> AverageReducer（对同 key 汇总 300 股并求平均；MultipleOutputs 按天输出 CSV）
-  -> ValueOnlyTextOutputFormat（只输出 CSV 行文本）
+  -> DayAverageReducer（对同 key 汇总 300 股并求平均）
+  -> DayCsvOutputFormat（每 reducer 输出一个 MMDD.csv，直接写字节数组）
 ```
 
 ## 1. 主要瓶颈（按影响优先级排序）
@@ -99,4 +99,3 @@ HDFS 输入（1500 个 snapshot.csv 小文件）
 ## 4. 下一阶段（optim_1）建议目标
 - 优先尝试“减少 mapper 数量”的方案（Combine 小文件 / 一 task 多文件）
 - 在该前提下再讨论是否保留/增强 combiner 或改成 in-mapper aggregation
-

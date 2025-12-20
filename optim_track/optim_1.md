@@ -13,7 +13,7 @@
 ## 1) 改动点（代码细读）
 
 ### 1.1 `Snapshot.parse` 改为“硬编码 int32 顺序解析”
-文件：`factor-mapreduce/src/main/java/factor/Snapshot.java`
+文件：`POGI-ONE-RELEASE/src/main/java/pogi_one/Snapshot.java`
 
 原实现：
 - `csvLine.split(",")` 全列切分（约 57 列）
@@ -35,7 +35,7 @@
 - 当前解析器只支持“纯数字的非负整数”字段（本项目数据满足）；如果未来出现负号/小数/科学计数法/引号包裹，会需要单独的慢路径。
 
 ### 1.2 `Snapshot.computeInto` 的“少循环/少除法”实现
-文件：`factor-mapreduce/src/main/java/factor/Snapshot.java`
+文件：`POGI-ONE-RELEASE/src/main/java/pogi_one/Snapshot.java`
 
 `computeInto` 本身也是热路径（每行都会算一次），代码里做了几类典型的常数优化：
 - 前 5 档相关的求和/加权求和都“手动展开”（unroll），避免 `for` 循环的边界检查与数组寻址开销。
@@ -53,7 +53,7 @@
 如果后续还要继续提速，下一阶段最有潜力的方向就是“把 per-line 分配继续压下去”（见第 5 节）。
 
 ### 1.4 `FactorWritable` 的设计与 Shuffle 影响
-文件：`factor-mapreduce/src/main/java/factor/FactorWritable.java`
+文件：`POGI-ONE-RELEASE/src/main/java/pogi_one/FactorWritable.java`
 
 `FactorWritable` 是 Map/Shuffle/Reduce 的核心载荷（payload）：
 - 结构：`double[20] factors`（20 个因子“求和态”），不带 `count`
@@ -82,7 +82,7 @@
 
 ## 4) 验证方式（本阶段建议记录的对照）
 
-- 编译与单测：`mvn -f factor-mapreduce/pom.xml test`
+- 编译与单测：`mvn -f POGI-ONE-RELEASE/pom.xml test`
 - 运行对照：
   - 同一输入（单天/全量）跑两次：对比 wall time
   - 对比 Hadoop 计数器：Map time、GC time（如有）、Shuffle bytes

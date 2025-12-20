@@ -54,19 +54,19 @@ OPTIM_3 的 `compactTime:int` 因为年份偏移会触发 bit31=1，排序需要
 ---
 
 ## 4) 变更点（文件级）
-- `factor-mapreduce/src/main/java/factor/StockFactorMapper.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/StockFactorMapper.java`
   - 输出 key 改为 `IntWritable`
   - 新增 `packCompactTime30(tradingDay, secOfDay)`（06:00 截断 + 30-bit 打包）
-- `factor-mapreduce/src/main/java/factor/FactorCombiner.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/FactorCombiner.java`
   - key 泛型从 `DayTimeKey` 改为 `IntWritable`
-- `factor-mapreduce/src/main/java/factor/DayPartitioner.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/DayPartitioner.java`
   - key 泛型改为 `IntWritable`，分区使用 `compact>>>15`
-- `factor-mapreduce/src/main/java/factor/AverageReducer.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/AverageReducer.java`
   - key 泛型改为 `IntWritable`
   - 解码输出 `tradeTime(HHMMSS)` 与 `MMDD.csv` 输出路径
-- `factor-mapreduce/src/main/java/factor/Driver.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/Driver.java`
   - `job.setMapOutputKeyClass(IntWritable.class)`（key 直通）
-- `factor-mapreduce/src/main/java/factor/DayTimeKey.java`
+- `POGI-ONE-RELEASE/src/main/java/pogi_one/DayTimeKey.java`
   - 已删除（去封装完成）
 
 ---
