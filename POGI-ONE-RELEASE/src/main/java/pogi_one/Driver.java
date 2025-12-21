@@ -39,10 +39,7 @@ import org.apache.hadoop.util.ToolRunner;
  *
  * <p><b>Driver配置：</b></p>
  * <p>
- * 本地并行度：读取 {@code Runtime.getRuntime().availableProcessors()}，写入
- * {@code mapreduce.local.map.tasks.maximum} 与 {@code mapreduce.local.reduce.tasks.maximum}。
- * </p><p>
- * 输入路径：传入数据的根目录 {@code <root>} ，股票的快照文件路径为 {@code <root>/* /* /snapshot.csv}。
+ * 输入路径：传入数据的根目录 {@code &lt;root&gt;} ，股票的快照文件路径为 {@code &lt;root&gt;.../snapshot.csv}。
  * </p><p>
  * dayIds 探测：扫描根目录一级子目录（MMDD），按出现顺序拼成 {@code finyp.dayIds=0102,0103,...} 写入 conf。
  * </p><p>
@@ -69,10 +66,6 @@ public class Driver extends Configured implements Tool {
 
         Configuration conf = new Configuration();
         setConf(conf);
-
-        int procs = Runtime.getRuntime().availableProcessors();
-        conf.setInt("mapreduce.local.map.tasks.maximum", procs);
-        conf.setInt("mapreduce.local.reduce.tasks.maximum", procs);
 
         // args[0] 必定是数据根目录，结构固定为：
         // <root>/<MMDD>/<stock>/snapshot.csv

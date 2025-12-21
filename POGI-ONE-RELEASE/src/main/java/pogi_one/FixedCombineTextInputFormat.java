@@ -88,7 +88,7 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
         for (int di = 0; di < dayCount; di++) {
             DayGroup g = byDay[dayOrder[di]];
             int n = g.size;
-            int splitsForDay = Math.min(p, n);
+            int splitsForDay = 1;
             int chunkSize = (n + splitsForDay - 1) / splitsForDay;
 
             for (int i = 0; i < n; i += chunkSize) {

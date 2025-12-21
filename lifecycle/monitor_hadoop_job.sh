@@ -8,7 +8,7 @@ Usage:
                           [--interval SEC] [--top N]
 
 Defaults (project-specific):
-  --input    /user/pogi/HD_INPUT_REPO/FINANCE_for_YP/*/*/snapshot.csv
+  --input    /user/pogi/HD_INPUT_REPO/FINANCE_for_YP
   --output   /user/pogi/HD_OUTPUT_REPO/FINANCE_for_YP/run_monitor_<timestamp>
   --jar      POGI-ONE-RELEASE/target/POGI-ONE-RELEASE-0.1.0-SNAPSHOT.jar
   --interval 0.2
@@ -24,7 +24,7 @@ Example:
 USAGE
 }
 
-INPUT="/user/pogi/HD_INPUT_REPO/FINANCE_for_YP/*/*/snapshot.csv"
+INPUT="/user/pogi/HD_INPUT_REPO/FINANCE_for_YP"
 OUTPUT="/user/pogi/HD_OUTPUT_REPO/FINANCE_for_YP/run_monitor_$(date +%Y%m%d_%H%M%S)"
 JAR="POGI-ONE-RELEASE/target/POGI-ONE-RELEASE-0.1.0-SNAPSHOT.jar"
 MAIN="pogi_one.Driver"
