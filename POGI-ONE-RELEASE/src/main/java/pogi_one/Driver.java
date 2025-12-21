@@ -21,69 +21,54 @@ import org.apache.hadoop.util.ToolRunner;
  * <p><b>项目目标：</b> 对 CSI300（300只股票）的 Level-10 行情快照（3秒频）计算 20 个订单簿因子，
  * 并在每个时间点对 300 只股票做截面平均，输出每天从 9:30 到 15:00 的平均因子序列。</p>
  *
+ * <p><b>Driver 职责：</b> 解析输入/输出路径，构建 Job 配置并提交作业。</p>
+ *
  * <p><b>整体流水线架构：</b></p>
- * <ol>
- *   <li><b>InputFormat：</b>{@link FixedCombineTextInputFormat} 组合多个 CSV 为一个 split（单文件不切分），
- *   以减少 mapper 数量，并保证 split 不跨 day。</li>
- *   <li><b>Mapper：</b>{@link StockFactorMapper} 逐行解析 CSV（直接在 {@code byte[]} 上做 ASCII 扫描），计算 20 个因子，
- *   在 mapper 内对同一 (day,time) 做本地聚合，输出 {@code (dayId,time)->sum[20]+count}。</li>
- *   <li><b>Partitioner：</b>{@link DayIdPartitioner} 保证 1 day / 1 reducer。</li>
- *   <li><b>Reducer：</b>{@link DayAverageReducer} 汇总各 split 的 sum+count，并计算截面均值输出当天 CSV。</li>
- *   <li><b>OutputFormat：</b>{@link DayCsvOutputFormat} 直接输出 reducer 生成的 CSV 行字节，
- *   只保留 value，避免 Hadoop 默认的 {@code key<TAB>value} 破坏 CSV 格式。</li>
- * </ol>
+ * <p>
+ * InputFormat：{@link FixedCombineTextInputFormat} 实现 day 间任务隔离，day 内组合多个股票 csv 为一个 split，单文件不切分。
+ * </p><p>
+ * Mapper：{@link StockFactorMapper} 逐行解析 CSV，在 {@code byte[]} 上做 ASCII 扫描，计算 20 个因子，
+ * 在 mapper 内对同一 (day,time) 做本地聚合，{@code cleanup()} 输出 {@code (dayId,time)->sum[20]+count}。
+ * </p><p>
+ * Partitioner：{@link DayIdPartitioner} 保证 1 day / 1 reducer。
+ * </p><p>
+ * Reducer：{@link DayAverageReducer} 一个 reducer 负责一个交易日，汇总各 split 的 sum+count，压缩股票维度（求均值）并写入 csv。
+ * </p><p>
+ * OutputFormat：{@link DayCsvOutputFormat} 输出 reducer 生成的 CSV 行字节，只保留 value。
+ * </p>
  *
- * <p><b>流水线本身示意图</b></p>
- * <pre>
- * (HDFS 输入目录，包含多个股票文件。结构：/<MMDD>/<stock>/snapshot.csv)
- *                 |
- *                 v
- *   +------------------------------+
- *   | InputFormat 读取文本行（CSV） |
- *   | Combine：多个文件合成一个 split |
- *   +------------------------------+
- *                 |
- *                 v
- *   +------------------------------+
- *   | Mapper（逐行）                |
- *   | 1) 跳过表头/空行              |
- *   | 2) 解析 CSV（取前5档）        |
- *   | 3) 计算 20 因子               |
- *   |    - alpha_17/18/19 依赖 t-1  |
- *   | 4) 输出：                     |
- *   |    key   = (dayId,time)      |
- *   |    value = sum[20] + count   |
- *   +------------------------------+
- *                 |
- * (HDFS 输出目录)
- *   output/
- *     0102.csv   (首行表头 + 多行 tradeTime 均值)
- *     0103.csv
- *     ...
- * </pre>
- *
- * <p><b>运行方式：</b>{@code hadoop jar ... pogi_one.Driver <input> <output>}</p>
+ * <p><b>Driver配置：</b></p>
+ * <p>
+ * 本地并行度：读取 {@code Runtime.getRuntime().availableProcessors()}，写入
+ * {@code mapreduce.local.map.tasks.maximum} 与 {@code mapreduce.local.reduce.tasks.maximum}。
+ * </p><p>
+ * 输入路径：传入数据的根目录 {@code <root>} ，股票的快照文件路径为 {@code <root>/* /* /snapshot.csv}。
+ * </p><p>
+ * dayIds 探测：扫描根目录一级子目录（MMDD），按出现顺序拼成 {@code finyp.dayIds=0102,0103,...} 写入 conf。
+ * </p><p>
+ * Reducer 数：与 dayIds 数量一致，确保 1 day / 1 reducer。
+ * </p><p>
+ * 输出格式：设置为 {@link DayCsvOutputFormat}，仅输出 CSV 行内容。
+ * </p>
  */
 public class Driver extends Configured implements Tool {
     
     private static final String CONF_DAY_IDS = "finyp.dayIds";
     private static final String JOB_NAME = "CSI300 Factor Calculation - POGI-ONE FINAL RELEASE";
     
+
+    public static void main(String[] args) throws Exception {
+        int rc = ToolRunner.run(new Driver(), args);
+        System.exit(rc);
+    }
+
+
     @Override
     public int run(String[] args) throws Exception {
-        System.out.println("@ Driver: Start timing");
         final long startNs = System.nanoTime();
 
-        if (args.length != 2) {
-            System.err.println("Usage: Driver <input path> <output path>");
-            return 2;
-        }
-
-        Configuration conf = getConf();
-        if (conf == null) {
-            conf = new Configuration();
-            setConf(conf);
-        }
+        Configuration conf = new Configuration();
+        setConf(conf);
 
         int procs = Runtime.getRuntime().availableProcessors();
         conf.setInt("mapreduce.local.map.tasks.maximum", procs);
@@ -133,6 +118,12 @@ public class Driver extends Configured implements Tool {
         return ok ? 0 : 1;
     }
 
+    
+    /**
+     * 扫描输入根目录的一级子目录名作为 dayId（MMDD），按发现顺序返回。
+     *
+     * <p>无排序 无格式校验 无不去重。</p>
+     */
     private static String[] discoverDayIdsFromRoot(Configuration conf, Path inputRoot) throws Exception {
         FileSystem fs = inputRoot.getFileSystem(conf);
         RemoteIterator<LocatedFileStatus> iter = fs.listLocatedStatus(inputRoot);
@@ -157,8 +148,4 @@ public class Driver extends Configured implements Tool {
         return trimmed;
     }
 
-    public static void main(String[] args) throws Exception {
-        int rc = ToolRunner.run(new Driver(), args);
-        System.exit(rc);
-    }
 }

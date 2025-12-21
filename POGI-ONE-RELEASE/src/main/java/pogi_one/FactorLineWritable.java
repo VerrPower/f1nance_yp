@@ -5,6 +5,11 @@ import java.io.DataOutput;
 import java.io.IOException;
 import org.apache.hadoop.io.Writable;
 
+/**
+ * Reducer 输出行容器：保存 secOfDay 与 20 维因子均值（float[20]）。
+ *
+ * <p>用于输出链路最短化：Reducer 直接写入本对象，RecordWriter 读取并格式化为 CSV。</p>
+ */
 public final class FactorLineWritable implements Writable {
     public static final int FACTOR_COUNT = 20;
 

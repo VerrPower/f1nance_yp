@@ -14,7 +14,25 @@ import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
-
+/**
+ * 输出格式：将 {@link DayAverageReducer} 产生的 {@link FactorLineWritable} 按天写成 CSV 文件（仅写 value，不写 key）。
+ *
+ * <p>
+ * 流水线上游是 mapper 输出 (dayId,timeCode)->sum[20]+count（{@link FactorWritable}），
+ * reducer 计算均值后产出 {@link FactorLineWritable}，本类负责把它序列化成 CSV 行字节。
+ * </p>
+ *
+ * <p>
+ * 文件名由 reducerId 在 {@code finyp.dayIds=0102,0103,...} 中定位得到，对应输出 {@code <dayId>.csv}。
+ * 实际写入发生在 {@link FileOutputCommitter#getWorkPath()}，任务成功后再由 commit 流程提交。
+ * </p>
+ *
+ * <p>
+ * RecordWriter 内部复用 {@code byte[] buf} 组装整行，浮点数通过
+ * {@link schubfach.SchubfachFloat#writeShortest(float, byte[], int, byte[])} 直接写入 buf，
+ * 避免 {@code Float.toString()/StringBuilder} 的临时对象，再写入 {@link BufferedOutputStream} 的大缓冲。
+ * </p>
+ */
 public final class DayCsvOutputFormat extends FileOutputFormat<NullWritable, FactorLineWritable> {
 
     private static final String CONF_DAY_IDS = "finyp.dayIds";
@@ -48,6 +66,11 @@ public final class DayCsvOutputFormat extends FileOutputFormat<NullWritable, Fac
         return new DayCsvRecordWriter(out);
     }
 
+    /**
+     * 从 conf 的 {@code finyp.dayIds} 中按顺序取出第 reducerId 个 dayId。
+     *
+     * <p>依赖 Driver 写入的顺序：dayId 发现顺序与 reducerId 一一对应。</p>
+     */
     private static String dayIdForReducer(Configuration conf, int reducerId) {
         String csv = conf.get(CONF_DAY_IDS, "");
         int start = 0;
@@ -64,6 +87,11 @@ public final class DayCsvOutputFormat extends FileOutputFormat<NullWritable, Fac
         return "";
     }
 
+    /**
+     * Reducer 输出的逐行写入器：把一条 {@link FactorLineWritable} 转成 CSV 行并写到输出流。
+     *
+     * <p>内部复用行缓冲与数字缓冲，尽量减少对象分配。</p>
+     */
     private static final class DayCsvRecordWriter extends RecordWriter<NullWritable, FactorLineWritable> {
         private final BufferedOutputStream out;
         private final byte[] buf = new byte[LINE_BUF_SIZE];
@@ -81,7 +109,7 @@ public final class DayCsvOutputFormat extends FileOutputFormat<NullWritable, Fac
             float[] f = value.factors;
             for (int i = 0; i < FACTOR_COUNT; i++) {
                 buf[pos++] = (byte) ',';
-                pos = writeFloatAsciiShortest(buf, pos, f[i], digits);
+                pos = SchubfachFloat.writeShortest(f[i], buf, pos, digits);
             }
             out.write(buf, 0, pos);
             out.write('\n');
@@ -109,14 +137,6 @@ public final class DayCsvOutputFormat extends FileOutputFormat<NullWritable, Fac
         buf[pos++] = (byte) ('0' + tens);
         buf[pos++] = (byte) ('0' + (v - tens * 10));
         return pos;
-    }
-
-    private static int writeFloatAsciiShortest(byte[] buf, int pos, float v) {
-        return writeFloatAsciiShortest(buf, pos, v, null);
-    }
-
-    private static int writeFloatAsciiShortest(byte[] buf, int pos, float v, byte[] digits) {
-        return SchubfachFloat.writeShortest(v, buf, pos, digits);
     }
 
 }

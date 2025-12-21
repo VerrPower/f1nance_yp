@@ -3,6 +3,11 @@ package schubfach;
 import java.nio.charset.StandardCharsets;
 import java.util.Random;
 
+/**
+ * SchubfachFloat 的小型自测与性能基准入口。
+ *
+ * <p>包含抽样正确性检查、百万级吞吐量基准、以及全量枚举测试（可调打印间隔）。</p>
+ */
 public final class SchubfachBench {
     private static final int SAMPLE_COUNT = 1_000_000;
     private static final int LOG_EVERY = 25_000_000;

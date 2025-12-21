@@ -1,5 +1,22 @@
 package schubfach;
 
+/**
+ * 基于 Schubfach 算法的 {@code float -> 十进制 ASCII} 最短表示（plain 格式）实现。
+ *
+ * <p><b>用途：</b> 本项目用于在 reducer 输出阶段把 {@code float} 直接写入 {@code byte[]}，
+ * 避免 {@code Float.toString}/{@code StringBuilder} 带来的对象分配与编码开销。</p>
+ *
+ * <p><b>算法来源：</b> Schubfach（Binary-to-Decimal conversion / shortest-roundtrip）。
+ * 论文（作者原文）：Giulietti, <i>"The Schubfach way to render doubles"</i><br>
+ * 链接：{@code https://drive.google.com/file/d/1gp5xv4CAa78SVgCeWfGqqI4FfYYYuNFb}</p>
+ *
+ * <p><b>实现特性/约束（与本项目需求对齐）：</b></p>
+ * <ul>
+ *   <li>输出为普通十进制（plain），不输出科学计数法（无 {@code 'e'/'E'}）。</li>
+ *   <li>对 {@code NaN/+Inf/-Inf} 以及 {@code 0.0f} 统一输出 {@code "0"}（项目内无需区分）。</li>
+ *   <li>目标是“最短且可 round-trip”的字符串：{@code Float.parseFloat(output)} 可还原原始 bit 模式。</li>
+ * </ul>
+ */
 public final class SchubfachFloat {
     private static final int FLOAT_MANTISSA_BITS = 23;
     private static final int FLOAT_MANTISSA_MASK = (1 << FLOAT_MANTISSA_BITS) - 1;

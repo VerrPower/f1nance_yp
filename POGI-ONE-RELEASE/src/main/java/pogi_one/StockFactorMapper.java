@@ -11,21 +11,47 @@ import org.apache.hadoop.mapreduce.Mapper;
  * <p><b>业务范围</b>：</p>
  * <ul>
  *   <li><b>输入</b> : 
- *          {@code <ShortWritable, Text>}：key 为文件索引（用于检测“换股票文件”）；
- *          value 为单行 CSV（CRLF 时可能含行尾 {@code '\r'}）。</li>
+ *          {@code <ShortWritable, Text>}：key 为文件索引，用于检测换股票csv；value 为单行 CSV</li>
  *   <li><b>解析</b> : 
- *          直接在 {@code byte[]} 上进行 ASCII 扫描解析，避免 {@code Text->String} 分配；
- *          只在行尾裁剪 {@code '\r'}。</li>
+ *          维护单个指针 {@code pos} 在 {@code byte[]} 上进行 ASCII 扫描解析，避免 {@code Text->String} 的转换开销；
+ *          依赖逗号作为字段分隔符，仅解析有价值数据，冗余信息直接跳过；在无需输出的情况下提前返回。
+ *          该方案严格依赖输入记录的完整性假设。</li>
  *   <li><b>计算20个因子</b> : 
  *          解析前 5 档盘口与必要字段，计算 20 个因子；其中 {@code alpha_17/18/19} 依赖 t-1 状态。
  *          当检测到 fileId 变化或时间倒退时清空。</li>
- *   <li><b>输出</b> : 
+ *   <li><b>输出</b> :
  *          mapper 输出 {@code <IntWritable, FactorWritable>}：
- *          key 为打包的 {@code (dayId,time)}，value 为 {@code sum[20]+count}（供 reducer 求均值）。</li>
+ *          key 为打包后的 32-bit int，value 为 {@code sum[20]+count}（供 reducer 求均值）。
+ *      <pre>
+ *             Bit diagram for packed 32-bit key
+ *      ┌──────────HIGH────────┬───────────MID──────────┬───────LOW───────┐
+ *      │ unused (6 bits)      │ dayId (MMDD)           │ timeCode (15)   │
+ *      │ bits: [31..26]       │ bits: [25..15]         │ bits: [14..0]   │
+ *      │                      │ range 0..1231          │ range 0..32767  │
+ *      └──────────────────────┴────────────────────────┴─────────────────┘
+ *      </pre>
+ *      其中：{@code packed = (dayId << 15) | timeCode}，dayId=MMDD，timeCode=secOfDay-06:00:00。
+ *    
+ *      <p><b>计算示例：</b></p>
+ *      <p>
+ *      1. 对于 <b>3月12日 09:30:05</b> 的数据：<br>
+ *      &nbsp;&nbsp; - dayId = 3 * 100 + 12 = 312<br>
+ *      &nbsp;&nbsp; - secOfDay = 9*3600 + 30*60 + 5 = 34205<br>
+ *      &nbsp;&nbsp; - timeCode = 34205 - 21600 = 12605<br>
+ *      &nbsp;&nbsp; - packed = (312 &lt;&lt; 15) | 12605 = 10236221
+ *      </p>
+ *      <p>
+ *      2. 对于 <b>11月30日 14:45:30</b> 的数据：<br>
+ *      &nbsp;&nbsp; - dayId = 11 * 100 + 30 = 1130<br>
+ *      &nbsp;&nbsp; - secOfDay = 14*3600 + 45*60 + 30 = 53130<br>
+ *      &nbsp;&nbsp; - timeCode = 53130 - 21600 = 31530<br>
+ *      &nbsp;&nbsp; - packed = (1130 &lt;&lt; 15) | 31530 = 37059370
+ *      </p>
  *   <li><b>Mapper 内聚合</b> : 
  *          在mapper中提前执行不同股票间因子值累加，对输入“张量”的“股票”维度进行压缩。
  *          把 20 维因子向量按照时间戳为key，累加到本地的 {@code AGG21_FP64} 哈希表（额外维护 count）；
- *          并在最后的 {@code cleanup()} 中批量输出聚合后的 KV。
+ *          并在最后的 {@code cleanup()} 中批量输出聚合后的 KV。由于额外维护了 count 属性，reducer 便可以根据 count 
+ *          动态计算特定时间戳特定因子的均值，无需依赖记录完整性假设，哪怕有时间戳记录缺失也能正确处理。
  *   </li>
  * </ul>
  */
@@ -34,7 +60,6 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
     // 常数列表
     private static final double EPSILON = 1.0e-7;
     private static final byte COMMA = (byte) ',';
-    private static final byte CR = (byte) '\r';
     private static final int BASE_SEC_6AM = 21600;
     private static final int MASK_TIME15 = (1 << 15) - 1;
     private static final int FACTOR_COUNT = 20;
@@ -48,8 +73,7 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
     private boolean dayInited = false;
     private int dayId = 0; // MMDD as int (e.g., 0102 -> 102)
 
-    
-    // t-1 相关状态（只保存计算 alpha_17/18/19 所需的最少信息）。
+    // alpha_17/18/19 在 t-1 时刻的相关状态
     private boolean hasPrev = false;
     private double prevAp1 = 0.0;
     private double prevBp1 = 0.0;
@@ -59,15 +83,65 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
     private int prevFileId = Integer.MIN_VALUE;
 
 
+
+
 // @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 // @#                                              ☆ Map 主函数 ☆                                            #@
 // @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    /**
+     * <p><b>职责：解析快照 CSV 单行并计算 20 个因子并写入本地聚合表</b></p>
+     *         
+     * <p><b>高性能单指针解析与算子融合</b></p>
+     * <p>
+     *      本方法直接操作底层字节数组 {@code s}，通过移动索引 {@code pos} 定位字段边界，避免使用 {@code String.split()} 等会产生中间对象的方法，实现零对象分配。
+     *      针对前 5 档盘口数据，采用手动循环展开优化，结合 {@code val = val * 10 + (c - '0')} 递推公式将 ASCII 数字序列原位转换为整数值。
+     *      解析过程中同步执行算子融合：在读取买卖盘价格与量（bp/bv/ap/av）的同时，在寄存器中实时累加 {@code sumVolumes}、{@code sumWeightedPrice} 及 {@code weightedDepth} 等统计量。
+     *      通过将字段解析与初步统计合并为单一流程，有效减少了内存重复访问开销，达到O(1)的内存占用。
+     * </p>
+     * <p><b>输入字段（含索引与是否使用标记）</b></p>
+     * <p>
+     * <b>tradingDay[0|Y]</b>, <b>tradeTime[1|Y]</b>, 
+     * </p><p>
+     * recvTime[2|×], MIC[3|×], code[4|×],
+     * </p><p>
+     * cumCnt[5|×], cumVol[6|×], 
+     * </p><p>
+     * turnover[7|×], last[8|×], open[9|×], 
+     * </p><p>
+     * high[10|×], low[11|×],
+     * </p><p>
+     * <b>tBidVol[12|Y]</b>, <b>tAskVol[13|Y]</b>, 
+     * </p><p>
+     * wBidPrc[14|×], wAskPrc[15|×], openInterest[16|×],
+     * </p><p>
+     * <b>bp1[17|Y]</b>, <b>bv1[18|Y]</b>, <b>ap1[19|Y]</b>, <b>av1[20|Y]</b>,
+     * </p><p>
+     * <b>bp2[21|Y]</b>, <b>bv2[22|Y]</b>, <b>ap2[23|Y]</b>, <b>av2[24|Y]</b>,
+     * </p><p>
+     * <b>bp3[25|Y]</b>, <b>bv3[26|Y]</b>, <b>ap3[27|Y]</b>, <b>av3[28|Y]</b>,
+     * </p><p>
+     * <b>bp4[29|Y]</b>, <b>bv4[30|Y]</b>, <b>ap4[31|Y]</b>, <b>av4[32|Y]</b>,
+     * </p><p>
+     * <b>bp5[33|Y]</b>, <b>bv5[34|Y]</b>, <b>ap5[35|Y]</b>, <b>av5[36|Y]</b>, （解析完最后一个有价值信息）
+     * </p><p>
+     * bp6[37|×], bv6[38|×], ap6[39|×], av6[40|×],
+     * </p><p>
+     * bp7[41|×], bv7[42|×], ap7[43|×], av7[44|×],
+     * </p><p>
+     * bp8[45|×], bv8[46|×], ap8[47|×], av8[48|×],
+     * </p><p>
+     * bp9[49|×], bv9[50|×], ap9[51|×], av9[52|×],
+     * </p><p>
+     * bp10[53|×], bv10[54|×], ap10[55|×], av10[56|×]
+     * </p>
+     * 
+     */
     @Override
     protected void map(ShortWritable p_key, Text p_value, Context p_context) 
         throws IOException, InterruptedException 
     {
-        // CombineFileInputFormat：一个 mapper 会顺序处理多个股票文件；alpha_17/18/19 的 t-1 必须在“同一股票文件”内定义。
-        // FixedCombineTextInputFormat 的输入 key 直接是 fileIndex（ShortWritable）：检测 fileId 变化时清空 t-1 状态。
+        // CombineFileInputFormat：一个 mapper 会顺序处理多个股票文件；alpha_17/18/19 的 t-1 必须在同一股票文件内
+        // FixedCombineTextInputFormat 的输入 key 是 fileIndex（ShortWritable），检测到 fileId 变化时清空 t-1 状态
         final int fileId = p_key.get();
         if (prevFileId != fileId) {
             prevFileId = fileId;
@@ -75,21 +149,16 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
             prevTradeTime = Integer.MIN_VALUE;
         }
 
-        // 进一步避免 Text->String 分配：直接在 byte[] 上做 ASCII 解析。
+        // 在 byte[] 上做 ASCII 解析，避免 Text->String 分配
         final int n = p_value.getLength();
-        if (n <= 0) return;
+        if (n <= 0) return;  // 防御一下
         final byte[] s = p_value.getBytes();
-        // Hadoop LineRecordReader 在 CRLF 文件中通常会保留行尾 '\r'（但不包含 '\n'）。
-        // 为了让每个字段的解析循环不必重复判断 '\r'，这里仅在行尾做一次裁剪。
-        int end = n;
-        if (s[end - 1] == CR) end--;
-        // 数据行以 YYYYMMDD 开头；表头以 't' 开头。这里用首字符快速过滤。
         final byte c0 = s[0];
-        if (c0 < '0' || c0 > '9') return;
+        if (c0 < '0' || c0 > '9') return; // 过滤表头。
 
-        // @===================================== 基于原始字节数组的单指针字段解析 ====================================@
-        // field 0/1：行首固定为 YYYYMMDD,HHMMSS,
-        // 只需要 MMDD：直接跳过 year 的 4 位。
+        // @================================ 基于原始字节数组的单指针字段解析 ================================@
+        // field 0/1：行首固定为 YYYYMMDD,HHMMSS
+        // 直接跳过 year 的 4 位，只需要 MMDD
         if (!dayInited) {
             int month = (s[4] - '0') * 10 + (s[5] - '0');
             int day = (s[6] - '0') * 10 + (s[7] - '0');
@@ -102,13 +171,12 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         final int secOfDay = hh * 3600 + mm * 60 + ss;
         int pos = 16; // 8 + ',' + 6 + ','
 
-        // Combine 可能让一个 mapper 处理多个文件，时间戳会“跳回早期”；遇到 tradeTime 逆序时清空 t-1。
+        // mapper函数将会处理多个股票csv文件 切换csv时又从早上九点开始遍历 检测到时间回拨 即为跨越csv
         if (hasPrev && secOfDay < prevTradeTime) hasPrev = false;
         
-
         // skip fields 2..11（10 个字段）
         for (int k = 0; k < 10; k++) {
-            while (pos < end && s[pos] != COMMA) pos++;
+            while (s[pos] != COMMA) pos++;
             pos++; // skip comma
         }
 
@@ -116,33 +184,34 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         int tBidVol = 0;
         int tAskVol = 0;
 
-        final boolean shouldEmit = (secOfDay >= 34_200 && secOfDay <= 41_400) || (secOfDay >= 46_800 && secOfDay <= 54_000);
+        final boolean shouldEmit = (secOfDay >= 34_200 && secOfDay <= 41_400) 
+            || (secOfDay >= 46_800 && secOfDay <= 54_000);
 
         if (shouldEmit) {
             // tBidVol
-            while (pos < end) {byte c = s[pos]; if (c == COMMA) break; tBidVol = tBidVol * 10 + (c - '0'); pos++; }
+            while (true) {byte c = s[pos]; if (c == COMMA) break; tBidVol = tBidVol * 10 + (c - '0'); pos++; }
             pos++; // skip comma
 
             // tAskVol
-            while (pos < end) {byte c = s[pos]; if (c == COMMA) break; tAskVol = tAskVol * 10 + (c - '0'); pos++; }
+            while (true) {byte c = s[pos]; if (c == COMMA) break; tAskVol = tAskVol * 10 + (c - '0'); pos++; }
             pos++; // skip comma
         } else {
-            // 非输出窗口行：alpha_10 不需要，跳过解析以降低常数开销。
-            while (pos < end && s[pos] != COMMA) pos++;
+            // 非输出窗口行 alpha_10 不需要 跳过
+            while (s[pos] != COMMA) pos++;
             pos++;
-            while (pos < end && s[pos] != COMMA) pos++;
+            while (s[pos] != COMMA) pos++;
             pos++;
         }
 
         // skip fields 14..16（3 个字段）
-        while (pos < end && s[pos] != COMMA) pos++;
+        while (s[pos] != COMMA) pos++;
         pos++;
-        while (pos < end && s[pos] != COMMA) pos++;
+        while (s[pos] != COMMA) pos++;
         pos++;
-        while (pos < end && s[pos] != COMMA) pos++;
+        while (s[pos] != COMMA) pos++;
         pos++;
 
-        // 解析前 5 档 bp/bv/ap/av，同时在线累计所需统计量（避免数组分配）。
+        // 手动循环展开解析前 5 档 bp/bv/ap/av，同时累计sum统计量
         double ap1 = 0.0, bp1 = 0.0, av1 = 0.0, bv1 = 0.0;
         double sumBidVolumes = 0.0, sumAskVolumes = 0.0;
         double sumBidWeightedPrice = 0.0, sumAskWeightedPrice = 0.0;
@@ -150,14 +219,14 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
 
         // level 1 (i=1)
         int bp1i = 0, bv1i = 0, ap1i = 0, av1i = 0;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bp1i = bp1i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bp1i = bp1i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bv1i = bv1i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bv1i = bv1i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; ap1i = ap1i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; ap1i = ap1i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; av1i = av1i * 10 + (c - '0'); pos++; }
-        if (pos < end && s[pos] == COMMA) pos++;
+        while (true) { byte c = s[pos]; if (c == COMMA) break; av1i = av1i * 10 + (c - '0'); pos++; }
+        if (s[pos] == COMMA) pos++;
         bp1 = (double) bp1i;
         bv1 = (double) bv1i;
         ap1 = (double) ap1i;
@@ -167,17 +236,17 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         sumBidWeightedPrice += bp1 * bv1; sumAskWeightedPrice += ap1 * av1;
         weightedBidDepth += bv1; weightedAskDepth += av1;
 
-        // levels 2..5: 手动展开，避免 level 分支树；并把字段解析 while 压成单行。
+        // levels 2,3,4,5 
         // level 2 (i=2)
         int bp2 = 0, bv2i = 0, ap2i = 0, av2i = 0;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bp2 = bp2 * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bp2 = bp2 * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bv2i = bv2i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bv2i = bv2i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; ap2i = ap2i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; ap2i = ap2i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; av2i = av2i * 10 + (c - '0'); pos++; }
-        if (pos < end && s[pos] == COMMA) pos++;
+        while (true) { byte c = s[pos]; if (c == COMMA) break; av2i = av2i * 10 + (c - '0'); pos++; }
+        if (s[pos] == COMMA) pos++;
         final double bv2 = (double) bv2i, av2 = (double) av2i;
         sumBidVolumes += bv2; sumAskVolumes += av2;
         sumBidWeightedPrice += ((double) bp2) * bv2; sumAskWeightedPrice += ((double) ap2i) * av2;
@@ -185,14 +254,14 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
 
         // level 3 (i=3)
         int bp3 = 0, bv3i = 0, ap3i = 0, av3i = 0;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bp3 = bp3 * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bp3 = bp3 * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bv3i = bv3i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bv3i = bv3i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; ap3i = ap3i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; ap3i = ap3i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; av3i = av3i * 10 + (c - '0'); pos++; }
-        if (pos < end && s[pos] == COMMA) pos++;
+        while (true) { byte c = s[pos]; if (c == COMMA) break; av3i = av3i * 10 + (c - '0'); pos++; }
+        if (s[pos] == COMMA) pos++;
         final double bv3 = (double) bv3i, av3 = (double) av3i;
         sumBidVolumes += bv3; sumAskVolumes += av3;
         sumBidWeightedPrice += ((double) bp3) * bv3; sumAskWeightedPrice += ((double) ap3i) * av3;
@@ -200,14 +269,14 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
 
         // level 4 (i=4)
         int bp4 = 0, bv4i = 0, ap4i = 0, av4i = 0;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bp4 = bp4 * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bp4 = bp4 * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bv4i = bv4i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bv4i = bv4i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; ap4i = ap4i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; ap4i = ap4i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; av4i = av4i * 10 + (c - '0'); pos++; }
-        if (pos < end && s[pos] == COMMA) pos++;
+        while (true) { byte c = s[pos]; if (c == COMMA) break; av4i = av4i * 10 + (c - '0'); pos++; }
+        if (s[pos] == COMMA) pos++;
         final double bv4 = (double) bv4i, av4 = (double) av4i;
         sumBidVolumes += bv4; sumAskVolumes += av4;
         sumBidWeightedPrice += ((double) bp4) * bv4; sumAskWeightedPrice += ((double) ap4i) * av4;
@@ -215,22 +284,22 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
 
         // level 5 (i=5)
         int bp5 = 0, bv5i = 0, ap5i = 0, av5i = 0;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bp5 = bp5 * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bp5 = bp5 * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; bv5i = bv5i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; bv5i = bv5i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; ap5i = ap5i * 10 + (c - '0'); pos++; }
+        while (true) { byte c = s[pos]; if (c == COMMA) break; ap5i = ap5i * 10 + (c - '0'); pos++; }
         pos++;
-        while (pos < end) { byte c = s[pos]; if (c == COMMA) break; av5i = av5i * 10 + (c - '0'); pos++; }
-        if (pos < end && s[pos] == COMMA) pos++;
+        while (true) { byte c = s[pos]; if (c == COMMA) break; av5i = av5i * 10 + (c - '0'); pos++; }
+        if (s[pos] == COMMA) pos++;
         final double bv5 = (double) bv5i, av5 = (double) av5i;
         sumBidVolumes += bv5; sumAskVolumes += av5;
         sumBidWeightedPrice += ((double) bp5) * bv5; sumAskWeightedPrice += ((double) ap5i) * av5;
         weightedBidDepth += bv5 * 0.2d; weightedAskDepth += av5 * 0.2d;
 
 
-        // @==================================== 计算20个因子，写入可复用缓存数组 ====================================@
-        // 非输出窗口：不需要计算 20 因子，只更新 t-1 状态即可。
+        // @=============================== 计算20个因子，写入可复用缓存数组 ================================@
+        // 非输出窗口：不需要计算 20 因子，只更新 t-1 状态即可
         if (!shouldEmit) {
             hasPrev = true;
             prevAp1 = ap1;
@@ -298,16 +367,18 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
         // 注意：即使不输出该条记录，也要维护 t-1 状态，
         // 因为 09:30:00 的 t-1 可能来自 09:29:57（在输出窗口之外）。
         // Key 编码（int32）：
-        // ┌────────────── FROM HIGH --to--> LOW ──────────────┐
-        // │ dayId = MMDD（数值） │ timeCode(15 bits)           │
-        // └───────────────────────────────────────────────────┘
+        // ┌───────────────────── FROM HIGH --to--> LOW ────────────────────────┐
+        // │ unused(6b,=0)    │ dayId(MMDD,0..1231)   │ timeCode(15b)           │
+        // │ bits:[31..26]    │ bits:[25..15]         │ bits:[14..0]            │
+        // │                  │                       │ secOfDay-06:00:00       │
+        // └────────────────────────────────────────────────────────────────────┘
         // - dayId：month*100+day（跳过 year），放在高位
         // - timeCode：secOfDay - 06:00:00，限定在 0..32767（低 15 位）
         int timeCode = secOfDay - BASE_SEC_6AM;
         int packedKey = (dayId << 15) | (timeCode & MASK_TIME15);
         localAggHashTable.add_by_python3p9(packedKey, factors);
 
-        // 更新 t-1（仅保留必要统计量）
+        // 更新 t-1
         hasPrev = true;
         prevAp1 = ap1;
         prevBp1 = bp1;
@@ -317,6 +388,24 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
     }
 
 
+
+
+
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+// @#                                         ☆ Mapper 内聚合哈希表 ☆                                         #@
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@    
+
+   /**
+     * Mapper 清理与最终输出阶段
+     * 
+     * <p>在所有 {@code map()} 调用结束后执行，负责将本地内存中缓存的聚合结果写出到 HDFS。</p>
+     * 
+     * <p>mapper对象全流程：</p>
+     * <p>1. Mapper 端预聚合：利用 {@code localAggHashTable} 按时间戳（packedKey）对因子进行累加和计数。</p>
+     * <p>2. 批量输出：遍历哈希表，将每个时间点的 {@code sum[20] + count} 封装为 {@code FactorWritable} 并写入上下文，
+     *    从而大幅减少 Shuffle 过程中的网络传输量。
+     * </p>
+     */
     @Override
     protected void cleanup(Context context) throws IOException, InterruptedException {
         // mapper 输出：对 (dayId, tradeTime) 的本地聚合 sum[20] + count。
@@ -324,8 +413,6 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
     }
 
 
-    // murmur...
-    // key 编码与 tradingDay/tradeTime 的解析均已内联到 map() 热路径（year 不再参与 key 编码）。
 
 
     
@@ -343,12 +430,11 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
      *
      * <b>性能优化设计：</b>
      * <p>
-     * 1. <b>固定容量（16384）</b>：
+     * 1. <b>初始容量16384 + 自动扩容</b>：
      * </p><p>
-     *      基于当前数据处理范围（单交易日最多 {@code 4802} 个时间点，
-     *      对应 9:30-11:30 + 13:00-15:00 窗口的 3 秒频数据），预分配足够容量以避免动态扩容。
-     *      若未来数据处理范围扩大（跨日、窗口延长或频率提高），可能触发溢出保护
-     *      （防御性编程而已，实际不大可能遇到）。
+     *      以单交易日最多 {@code 4802} 个时间点为基准设置初始容量，
+     *      并在负载超过阈值时自动扩容，避免溢出。
+     *      如未来时间范围扩大或频率提升，仍能通过扩容维持正确性。
      * </p><p>
      * 2. <b>容量取 2 的幂</b>：
      * </p><p>
@@ -356,32 +442,31 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
      * </p><p>
      * 3. <b>先进的探测算法</b>：
      * </p><p>
-     *      benchmark实测显示， {@code CPython 3.9} 的字典的增删
-     *      反而显著快于 <b>c++</b> 标准库{@code std::map}（底层红黑树）和{@code std::unordered_map}（底层哈希表，具体实现没研究）。
-     *      研究 {@code CPython 3.9} 源码发现，其采用了先进的<b>伪随机序列</b> 和<b>扰动探测递推</b> ：
-     *      {@code perturb >>>= 5; ptr = (5*ptr + 1 + perturb) & MASK;} （{@code MASK=CAPACITY-1}）。
-     *      其中容量必须为 2 的幂，否则寻址与探测性质失效。
-     *      除此之外，{@code CPython 3.9} 还针对不同键对象做了单独优化，这里不展开。
-     *      这个哈希表复刻了 {@code CPython 3.9} 的 dict 的关键部分。
+     *      根据基准测试结果，在增删操作方面，{@code CPython 3.9} 内置字典的性能显著优于 C++ 标准库的 
+     *      {@code std::map}（基于红黑树）和 {@code std::unordered_map}（基于哈希表，具体实现未深入分析）。
+     *      经查阅 {@code CPython 3.9} 源码发现，其字典实现采用了基于<b>伪随机序列</b>和<b>扰动探测递推</b>的探测机制，
+     *      具体递推公式为：{@code perturb >>>= 5; ptr = (5*ptr + 1 + perturb) & MASK;}（其中 {@code MASK = CAPACITY - 1}）。
+     *      该算法要求容量必须为 2 的幂，否则其寻址与探测性质将失效。
+     *      除探测机制外，{@code CPython 3.9} 还为不同类型的键对象实现了针对性优化，此处不再展开。
+     *      本哈希表的设计复现了 {@code CPython 3.9} 字典实现中的核心探测逻辑。
      * </p><p>
-     * 4. <b>简化操作语义</b>：
+     * 4. <b>简化操作</b>：
      * </p><p>
      *      仅支持插入与累加，不提供删除功能，
      *      匹配 Mapper 单次构建、cleanup 阶段输出的使用模式。
      * </p><p>
-     * <b>[锐评一下]</b>
-     * </p><p>
-     *      测试发现，当前 key 分布在 16384 个槽位的地址空间里恰好构成完美哈希，<b>冲突率为 0</b>。
-     *      我曾尝试过基于该特化分布设计静态完美哈希，但实际测试显示相对于 {@code CPython 3.9} 方案提升不足 <b>0.1</b> 秒。
-     *      考虑到数据分布可能变化（跨日或时间编码调整），最终采用 {@code CPython 3.9} 中通用的伪随机探测逻辑，
-     *      在保证通用性的同时意外获得了当前数据集的最佳性能表现。
-     * </p><p>
-     *      实际上，上面的对时间戳的30bit位运算压缩的优化效果比优化哈希表大得多，bench测试显示比类封装版本的key快了10多秒？
-     *      而哈希表优化（先是实现的线性探测，后面改为完美哈希，最后又复刻python3.9字典）带来的提升只能说“统计不显著”，
-     *      因为整个程序的热点函数一定在HDD<->RAM的IO上，而不是那寥寥几个哈希冲突。
-     * </p><p>
-     *      最后，我们只能无奈地总结道，在这个场景之下，哈希表并不是瓶颈，对他的优化注定不会带来显著的提升。
-     *      我们最终选择 {@code CPython 3.9} 的版本更多的是出于对其算法本身的欣赏
+     * <b>REMARK BY AUTHOR</b>
+     * <p>
+     *      测试表明，当前键值在 16384 个槽位中呈现出零冲突的完美哈希分布。虽然曾尝试设计针对该特定分布的静态完美哈希，
+     *      但实际性能相比 {@code CPython 3.9} 字典方案提升不足 0.1 秒。考虑到数据分布可能随跨日或时间编码调整而变化，
+     *      最终决定采用 {@code CPython 3.9} 通用的伪随机探测逻辑，在确保通用性的同时，在当前数据集上实现了最优性能。
+     * </p><p>  
+     *      进一步分析表明，时间戳的 30 位压缩优化效果远超过哈希表本身的优化，基准测试显示其相比类封装方案可提升超过 10 秒。
+     *      而哈希表内部的各类优化（线性探测、完美哈希、以及当前仿 {@code CPython 3.9} 的实现）带来的性能增益均不显著，
+     *      这是因为程序的主要性能瓶颈在磁盘 I/O 与内存之间，而非哈希碰撞的微调。
+     * </p><p>  
+     *      因此可以得出结论：在此应用场景下，哈希表并非关键瓶颈，进一步的优化难以带来明显的整体提升。
+     *      当前采用 {@code CPython 3.9} 的探测策略，更多是基于其算法本身的简洁性与通用性考量。
      * </p>
      */
     private static final class AGG21_FP64 {
@@ -501,6 +586,10 @@ public class StockFactorMapper extends Mapper<ShortWritable, Text, IntWritable, 
             mask = newMask;
         }
 
+        /**
+         * 将哈希表中已聚合的 sum+count 逐条写出到 Mapper Context。
+         * <p>仅做遍历与拷贝，不再做任何求和计算；key 为打包后的 (dayId,timeCode)。</p>
+         */
         void emitTo(Context context, IntWritable outKey, FactorWritable outValue)
                 throws IOException, InterruptedException {
             final int[] keys = this.keys;

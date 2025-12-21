@@ -18,19 +18,18 @@ import org.apache.hadoop.mapreduce.lib.input.FileSplit;
 import org.apache.hadoop.mapreduce.lib.input.LineRecordReader;
 
 /**
- * Combine InputFormat：将多个 CSV 合并为一个 split（按文件数控制），每个文件保持不切分。
+ * Combine InputFormat：按交易日分组切分；日间互不跨 split，日内按股票 CSV 聚合到若干 split。
  *
- * 关键目标：
- * <ul>
- *   <li><b>split 不跨交易日</b>：day 之间任务完全独立。</li>
- *   <li><b>day 内均匀切分</b>：若该 day 有 N 个股票 csv，则按 P 份均匀切分，P 写死为
- *       {@code min(8, Runtime.getRuntime().availableProcessors())}。</li>
- * </ul>
+ * <p><b>切分粒度：</b> 单个股票 CSV 是最小粒度（不可再切），单个交易日是最大边界（split 不跨 day）。</p>
+ *
+ * <p><b>日内切分数：</b> 设 {@code P = min(8, availableProcessors)}，每个交易日的 split 数为
+ * {@code min(P, N)}，其中 {@code N} 为该交易日的 CSV 文件数；再按均匀块大小分组。</p>
+ *
+ * <p><b>上限为 8 的原因：</b> 本项目运行在本地模式（单机多线程），非真实集群；容器资源为
+ * 2 物理核 / 4 逻辑核。为避免测试环境变动，核数提高导致切分过细，设置日内切分上限为 8。</p>
  */
 public final class FixedCombineTextInputFormat extends CombineFileInputFormat<ShortWritable, Text> {
     public static final int MAX_THREADS = 8;
-    private static final boolean PRINT_SPLIT_PLAN = false;
-
     static {
         System.out.printf("@ FixedCombineTextInputFormat: maxThreads=%d%n", MAX_THREADS);
     }
@@ -52,9 +51,13 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
         List<FileStatus> files = listStatus(job);
         List<InputSplit> splits = new ArrayList<>();
 
-        // 关键保证：split 不跨交易日（day 之间任务完全独立；且 mapper 的 dayId 取自首行）。
+        // 【1】扫描所有输入文件并按交易日分组：
+        // byDay: 以 dayId 为索引的 DayGroup 数组；每个 dayId 对应一个 DayGroup。
+        // dayOrder: 记录发现的 dayId 顺序，用于后续按该顺序生成 split。
+        // 对每个文件：解析 dayId -> 取得/创建 DayGroup -> 记录 dayId 顺序 -> 保存路径与文件大小。
+        // 保证 split 不跨 day（同一天的文件只会进入同一个 DayGroup）。
         // 路径结构期望：.../<day>/<stock>/snapshot.csv
-        DayGroup[] byDay = new DayGroup[10_000];
+        DayGroup[] byDay = new DayGroup[1232];
         int[] dayOrder = new int[16];
         int dayCount = 0;
         for (FileStatus stat : files) {
@@ -75,12 +78,16 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
             g.add(path, stat.getLen());
         }
 
-        int splitIndex = 0;
+        // 【2】按交易日切分生成 CombineFileSplit：
+        // p: 日内切分数上限（min(MAX_THREADS, availableProcessors)）。
+        // splitsForDay: 该 day 实际 split 数（min(p, n)）。
+        // chunkSize: 每个 split 承载的文件数上限（ceil(n / splitsForDay)）。
+        // 逐块复制路径与长度，构造 CombineFileSplit 并加入 splits。
+        int procs = Runtime.getRuntime().availableProcessors();
+        int p = Math.min(MAX_THREADS, Math.max(1, procs));
         for (int di = 0; di < dayCount; di++) {
             DayGroup g = byDay[dayOrder[di]];
             int n = g.size;
-            int procs = Runtime.getRuntime().availableProcessors();
-            int p = Math.min(MAX_THREADS, Math.max(1, procs));
             int splitsForDay = Math.min(p, n);
             int chunkSize = (n + splitsForDay - 1) / splitsForDay;
 
@@ -88,27 +95,30 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
                 int j = Math.min(i + chunkSize, n);
                 Path[] groupPaths = g.copyPaths(i, j);
                 long[] groupLengths = g.copyLengths(i, j);
-                if (PRINT_SPLIT_PLAN) {
-                    debugPrintGroup(splitIndex, groupPaths);
-                }
                 splits.add(makeSplit(groupPaths, groupLengths));
-                splitIndex++;
             }
         }
 
         return splits;
     }
 
+    /**
+     * DayGroup：每个交易日一个实例，保存该 day 目录下的所有股票 CSV 信息（路径与文件大小）。
+     * 为保证通用性，内部数组支持自动扩容；初始容量设为 512，避免在常见 300 文件规模下频繁扩容。
+     */
     private static final class DayGroup {
-        private Path[] paths = new Path[16];
-        private long[] lengths = new long[16];
+        private static final int INIT_CAP = 512;
+        private static final double GROWTH_FACTOR = 1.56d;
+
+        private Path[] paths = new Path[INIT_CAP];
+        private long[] lengths = new long[INIT_CAP];
         private int size = 0;
 
         void add(Path path, long len) {
             if (size == paths.length) {
-                int next = paths.length << 1;
-                Path[] pNext = new Path[next];
-                long[] lNext = new long[next];
+                int nextSize = (int) Math.ceil(size * GROWTH_FACTOR);
+                Path[] pNext = new Path[nextSize];
+                long[] lNext = new long[nextSize];
                 System.arraycopy(paths, 0, pNext, 0, paths.length);
                 System.arraycopy(lengths, 0, lNext, 0, lengths.length);
                 paths = pNext;
@@ -134,43 +144,15 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
         }
     }
 
-    private static void debugPrintGroup(int splitIndex, Path[] groupPaths) {
-        if (groupPaths.length == 0) {
-            return;
-        }
-        String firstDay = dayFromSnapshotPath(groupPaths[0]);
-        String lastDay = dayFromSnapshotPath(groupPaths[groupPaths.length - 1]);
-        boolean singleDay = true;
-        for (int i = 1; i < groupPaths.length; i++) {
-            if (!firstDay.equals(dayFromSnapshotPath(groupPaths[i]))) {
-                singleDay = false;
-                break;
-            }
-        }
-        System.out.printf(
-                "@ SplitPlan #%d: files=%d singleDay=%s firstDay=%s lastDay=%s first=%s last=%s%n",
-                splitIndex,
-                groupPaths.length,
-                singleDay ? "Y" : "N",
-                firstDay,
-                lastDay,
-                groupPaths[0],
-                groupPaths[groupPaths.length - 1]);
-    }
-
-    private static String dayFromSnapshotPath(Path snapshotPath) {
-        // Expect: .../<day>/<stock>/snapshot.csv
-        Path p = snapshotPath;
-        if (p == null) return "?";
-        p = p.getParent(); // stock
-        if (p == null) return "?";
-        p = p.getParent(); // day
-        if (p == null) return "?";
-        return p.getName();
-    }
-
+    /**
+     * 从 snapshot.csv 的路径中解析 dayId（MMDD 数值）。
+     * 路径结构假设：.../<day>/<stock>/snapshot.csv，其中 day 为四位数字字符串。
+     */
     private static int dayIdFromSnapshotPath(Path snapshotPath) {
-        String day = dayFromSnapshotPath(snapshotPath);
+        // Expect: .../<day>/<stock>/snapshot.csv
+        Path p = snapshotPath.getParent().getParent(); // 上两级目录：day
+        String day = p.getName(); // day 目录名，格式 MMDD
+        // 将 "MMDD" 转为 int（例如 "0102" -> 102）
         int d0 = day.charAt(0) - '0';
         int d1 = day.charAt(1) - '0';
         int d2 = day.charAt(2) - '0';
@@ -191,11 +173,19 @@ public final class FixedCombineTextInputFormat extends CombineFileInputFormat<Sh
         private final LineRecordReader lineReader = new LineRecordReader();
         private final ShortWritable key = new ShortWritable();
 
-        public CombineFileLineRR(CombineFileSplit split, TaskAttemptContext attemptContext, Integer index) throws IOException {
+        public CombineFileLineRR(CombineFileSplit split, TaskAttemptContext attemptContext, Integer index) 
+            throws IOException 
+        {
             this.index = index;
             lineReader.initialize(
-                    new FileSplit(split.getPath(index), split.getOffset(index), split.getLength(index), split.getLocations()),
-                    attemptContext);
+                    new FileSplit(
+                        split.getPath(index), 
+                        split.getOffset(index), 
+                        split.getLength(index), 
+                        split.getLocations()
+                    ),
+                    attemptContext
+                );
         }
 
         @Override
